@@ -13,11 +13,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yuweihao17/codearts.git"
+    "url": "git+https://github.com/Sakura-Natsu/codearts.git"
   },
-  "homepage": "https://github.com/yuweihao17/codearts#readme",
+  "homepage": "https://github.com/Sakura-Natsu/codearts#readme",
   "bugs": {
-    "url": "https://github.com/yuweihao17/codearts/issues"
+    "url": "https://github.com/Sakura-Natsu/codearts/issues"
   },
   "magpie": {
     "maxConcurrency": 3,

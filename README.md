@@ -10,6 +10,15 @@
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
 （盘古 openPangu、DeepSeek、GLM 等）。
 
+> 本仓库 fork 自 [yuweihao17/codearts](https://github.com/yuweihao17/codearts)，在其基础上修复了  
+> 会话上限、无输出、计费等问题并增加了每日签到（见上游 [PR #8](https://github.com/yuweihao17/codearts/pull/8)），  
+> 上游合并前在这里维护。
+
+> ⚠️ **免责声明**：这是**非官方**的社区插件，与华为、华为云及 CodeArts（码道）没有任何关联，  
+> 也未获其授权或认可；文中提到的名称与标识归其各自所有者所有。插件调用的是码道客户端使用的  
+> 非公开接口，并以与官方客户端相同的方式标识自己（含自动领取每日免费权益与签到），这可能不  
+> 符合华为云的服务条款，接口也可能随时变更。使用本插件的风险（包括账号受限）由使用者自行承担。
+
 CodeArts 的模型网关确实是 OpenAI 兼容的 Chat Completions 接口，但它**不接受 API  
 Key**：请求要用临时的 AK/SK/security-token 凭据做 *SDK-HMAC-SHA256* 签名，而这些  
 凭据要靠 OAuth 登录取得。本插件完整实现了这条链路：
@@ -36,9 +45,11 @@ Key**：请求要用临时的 AK/SK/security-token 凭据做 *SDK-HMAC-SHA256* �
 ## 安装
 
 ```sh
-magpie plugin add yuweihao17/codearts
+magpie plugin add Sakura-Natsu/codearts
 
 ```
+
+之前装过上游版本的，先用 `magpie plugin list` 找到它的名字，`magpie plugin rm <名字>` 卸掉再装。
 
 或本地开发：
 
@@ -155,6 +166,15 @@ magpie 侧：在 **设置 → 用量 → Plugins** 打开 CodeArts 的「每日�
 [Huawei Cloud CodeArts (码道)](https://www.huaweicloud.com/product/codearts.html) with
 **Huawei Cloud OAuth** (PKCE + DPoP) and exposes its models (openPangu, DeepSeek, GLM, …).
 
+This repository is a fork of [yuweihao17/codearts](https://github.com/yuweihao17/codearts) with the fixes proposed
+upstream in [PR #8](https://github.com/yuweihao17/codearts/pull/8), maintained here until they are merged.
+
+> **Disclaimer.** This is an **unofficial** community plugin. It is not affiliated with, authorized or endorsed by
+> Huawei, Huawei Cloud or CodeArts; their names and marks belong to their owners. It talks to the non-public APIs the
+> CodeArts client uses and identifies itself the way that client does (including claiming the daily free benefit and
+> check-in), which may not be allowed by Huawei Cloud's terms of service, and those APIs may change at any time.
+> Use it at your own risk, including the risk of restrictions on your account.
+
 The CodeArts gateway is OpenAI-compatible Chat Completions, but it does **not** accept an API key:
 every request must be signed with temporary AK/SK/security-token credentials (*SDK-HMAC-SHA256*),
 and those credentials come from an OAuth sign-in. This plugin implements the whole chain —
@@ -163,8 +183,10 @@ local-callback PKCE OAuth, per-request SDK-HMAC-SHA256 signing, silent refresh �
 ### Install
 
 ```sh
-magpie plugin add yuweihao17/codearts
+magpie plugin add Sakura-Natsu/codearts
 ```
+
+If you installed the upstream version before, find it with `magpie plugin list` and `magpie plugin rm` it first.
 
 ### Sign in
 
@@ -215,6 +237,18 @@ The plugin implements magpie's `auth.checkin` hook with the same three calls the
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
 - No MCP / gateway middleware — model access only.
 
+## 致谢 / Acknowledgements
+
+-   [yuweihao17](https://github.com/yuweihao17)：原作者，OAuth 登录、请求签名与插件骨架出自上游仓库。
+-   [HuHong-Tao](https://github.com/HuHong-Tao)：上游 [PR #6](https://github.com/yuweihao17/codearts/pull/6)  
+    与 [issue #1](https://github.com/yuweihao17/codearts/issues/1) 中的实测（流式会话占位、`thinking` 分流、  
+    模型前缀、输出上限、临时凭据过期、从 `refresh_token` 识别账号）。
+-   [ReachForStar](https://github.com/ReachForStar)：[fork](https://github.com/ReachForStar/codearts) 中的实测与实现  
+    （非流式不计费与流式折叠、免费模型的日期后缀 id、200 内嵌错误换算、用量窗口只让总积分参与路由）。
+-   上游 issue [#1](https://github.com/yuweihao17/codearts/issues/1)、[#5](https://github.com/yuweihao17/codearts/issues/5)、  
+    [#7](https://github.com/yuweihao17/codearts/issues/7) 中提供复现与数据的各位。
+-   [Ebony-Vinyl/dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)：上游实现所参照的 CodeArts 通道。
+
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). Copyright © 2026 yuweihao17 (original author) and Sakura-Natsu (this fork).
