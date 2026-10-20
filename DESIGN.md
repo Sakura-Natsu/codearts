@@ -81,8 +81,8 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 | 并发会话上限 `TM.00001041` | 每账号 3 个会话，会话结束后还占位约 60 秒；网关按 `x-ot-session-id` 区分会话，旧代码不发这个头，于是每个请求都是一个新会话 | `accountSessionIds`：账号级稳定会话 id（登录时生成 `session_id`，续期保留，跨进程一致），按码道客户端（`agentkernelServer` 的 `getInferhubHcHeaders`）发送 `x-ot-session-id` / `user-session-id` 与每请求随机的 trace 头；`createConcurrencyGate`：账号内在途 ≤ 3，许可持有到响应体结束；`signedFetch`：400 或 200 首事件里的 `TM.00001041` 带抖动退避重试（每次重签），预算耗尽返回 `429` 让 magpie 切账号 |
 | 网关排队 | `429` + `queue-status: queued` + `trace-id` / `retry-after` | `waitInQueue`：照客户端轮询 `GET /api/v1/concurrency/trace-queues/{trace-id}`，`promoted` 后重发原请求，`not_found` / `error` / 超时返回 `429`，放弃时 `DELETE` 退出队列 |
 | `InferHub.4004.200 benefit not found` | 免费模型要先领取当日权益：码道内核 `loadBenefitModels` 先 `getGatewayConfig`，再 `claimBenefit`（`POST opengw /api/v1/benefit/claim`，`error_code === "0000"` 为成功），失败就不加载免费模型；插件从没领取过 | `ensureBenefitClaimed`：每个北京自然日每账号领一次（单飞，被拒一小时后再试，连不上沿用上次结果），成功才把 `gateway/config` 的模型列为免费并发 benefit 头；仍收到 `4004` / `4005` 且模型在内置列表中时去掉头重发，并按账号记住 |
-| magpie 里倍率不对 / 免费标记不对 | 插件从没上报 `rate`；免费标记落回静态兜底 | `fetchAgentModels`：`/v1/agent-center/agents/useragents` 找 `original_id === "CodeAgent"` 的智能体，再读 `agents/detail` 的 `gpts.models`（码道内核 `provider-models-plugin` 同款），`credit[].ratio_display` → `rate`，`thinking_type` → 推理模型，`context_window` / `max_tokens` → 上限；`free` 只在当日权益领取成功时为真 |
-| 积分有效期 | 接口不给每批积分的过期日（客户端读了 `package_credit_expiring_amount` 但从不显示） | 月度桶（总积分、基础积分包）的 `resetsAt` = `statistics/plugin.end_date`（客户端「等待至 {resetDate} 额度重置」）；即将过期数量写进 `display`；签到成功写一条本地账本（发放日 + 30 天，或领取结果里的过期字段），用量里「赠送积分包」给出最早一批的 `runsOutAt` / `runsOut`；免费额度窗口按北京零点重置 |
+| magpie 里倍率不对 / 免费标记不对 | 插件从没上报 `rate`；免费标记落回静态兜底 | `fetchAgentModels`：`/v1/agent-center/agents/useragents` 找主智能体（`original_id` 为 `build`，旧列表叫 `CodeAgent`；客户端的 `CODE_AGENT_AGENT_ID`，日志中为 `a8bcb36232554267a5142361cc25a393`，列表读不到时用它），再读 `agents/detail` 的 `gpts.models`（客户端 `doGetTaskListInfoRequest` 同款），某个智能体没有模型就试下一个，`credit[].ratio_display` → `rate`，`thinking_type` → 推理模型，`context_window` / `max_tokens` → 上限；`free` 只在当日权益领取成功时为真 |
+| 积分有效期 | `statistics/plugin` 只给各桶余额；每批积分的到期时间在控制台「套餐与用量 → 获取明细」 | `fetchCreditBatches`：照控制台的请求（`/portal/snap-manager/*`、`/portal/promptcenter/*` 即 snap-access 的 `/snap-manager/*`、`/*`），`POST /snap-manager/v1/package/credit/page`（`{packageTypes:["basic","ondemand"]}` 与 `["bonus"]`）取 `expiredTime`，`GET /v1/ops/credit/overview` → `/v1/ops/credit/campaign/{id}` 取每笔 `expireAt`；套餐批次的到期即月度重置（`resetsAt`），其余按最早到期的一天给 `runsOutAt` / `runsOut`（总积分不含套餐批次）；10 分钟缓存，签到后失效；读不到时退回本地签到账本（领取 + 30 天）与 `end_date`；免费额度窗口按北京零点重置 |
 | 签名查询串 | 多参数查询未排序即签名 | `canonicalQuery`：按 key、value 排序并 RFC 3986 编码 |
 | 没有输出 | 推理模型默认把思考写进 `content` | `prepareChatBody` 默认注入 `thinking: { type: "enabled" }`，被拒时去掉重发 |
 | 看似成功实则失败 | 额度用尽 / 模型未注册以 200 + SSE 内嵌 `error_code` 返回 | `peekAnswer` + `classifyHead` 先读到首个有内容的事件再交出；纯错误换算为 `429`（额度、限流）/ `502`，带厂商原话 |
@@ -127,7 +127,7 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 4. `index.test.mjs` 覆盖签名、PKCE/DPoP、凭据往返、远端列表、loader 签名、
    续期、用量、回调服务器，以及 0.2.0 的会话上限重试、并发闸门、流式折叠、内嵌错误
    换算、凭据自愈、会话头、网关排队、benefit 领取与回退、倍率、积分重置与签到账本、每日签到，
-   全程不联网（`node --test`，76 项）。
+   全程不联网（`node --test`，79 项）。
 5. `registry-entry.json` 提供加入 `magpie` 插件市场的登记项。
 
 ## 四、目录

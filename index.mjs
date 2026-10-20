@@ -75,9 +75,28 @@ const BENEFIT_OK = "0000"
 const AGENT_LIST_URL = `${SNAP_HOST}/v1/agent-center/agents/useragents?offset=0&limit=100`
 const AGENT_DETAIL_URL = (id) => `${SNAP_HOST}/v1/agent-center/agents/detail?agent_id=${encodeURIComponent(id)}`
 const CODE_AGENT_ID = "CodeAgent"
+// The agent the IDE reads its model list from (its CODE_AGENT_AGENT_ID): the
+// one whose `original_id` is "build", 「自主规划与执行」; older lists call it
+// CodeAgent. Its id, as the IDE asks for it, stands in when the list can't be read.
+const MAIN_AGENT_ORIGINAL_IDS = ["build", CODE_AGENT_ID]
+const MAIN_AGENT_FALLBACK_ID = "a8bcb36232554267a5142361cc25a393"
+// Agents tried for a model list before giving up.
+const AGENT_DETAIL_TRIES = 3
 const AGENT_CENTER_HEADERS = { "Content-Type": "application/json", "Agent-Type": "AgentCenter", "X-Language": "zh-cn" }
 // Check-in credits are good for 30 days from when they are given.
 const CHECKIN_CREDIT_DAYS = 30
+// Every credit batch with its own expiry, as the console's 「获取明细」 reads
+// them (its /portal/snap-manager and /portal/promptcenter calls are these):
+// the plan's and bought packages, then the campaigns' grants (sign-up, check-in).
+const PACKAGE_CREDIT_PAGE_URL = `${SNAP_HOST}/snap-manager/v1/package/credit/page`
+const PACKAGE_CREDIT_QUERIES = [
+  { pageNum: 1, pageSize: 100, sortField: "created_time", sortOrder: "desc", packageTypes: ["basic", "ondemand"] },
+  { pageNum: 1, pageSize: 100, packageTypes: ["bonus"] },
+]
+const OPS_CREDIT_OVERVIEW_URL = `${SNAP_HOST}/v1/ops/credit/overview`
+const OPS_CREDIT_CAMPAIGN_URL = (id) => `${SNAP_HOST}/v1/ops/credit/campaign/${encodeURIComponent(id)}?pageNum=1&pageSize=100`
+// The batches change slowly; read them again this often (and after a check-in).
+const CREDIT_BATCHES_TTL_MS = 10 * 60 * 1000
 // Daily check-in (「限时福利 → 每日领取」), as the IDE's ActivityWelfarePane calls it.
 const OPS_DELIVERY_URL = `${SNAP_HOST}/v1/ops/delivery?channel=IDE`
 const OPS_CLAIM_URL = `${SNAP_HOST}/v1/ops/claim`
@@ -1432,6 +1451,74 @@ async function dailyCampaign(cred, fetcher) {
 
 const isClaimedToday = (item) => !item?.claimable && CLAIMED_STATUSES.includes(item?.status)
 
+// ---- credit batches and when they lapse ------------------------------------
+
+const PACKAGE_TYPE_METRICS = {
+  basic: "usageBasicPackageCredit",
+  ondemand: "usageOnDemandPackageCredit",
+  bonus: "usageBonusPackageCredit",
+}
+
+/**
+ * Every credit batch the account holds, as `{ metric, amount, left, expiresAt }`
+ * (`metric` the statistics bucket it counts in, `expiresAt` ms): the packages
+ * from `package/credit/page`, and each campaign's grants from `ops/credit`.
+ * Undefined when none of it could be read.
+ */
+async function fetchCreditBatches(cred, fetcher) {
+  const batches = []
+  let reached = false
+  for (const query of PACKAGE_CREDIT_QUERIES) {
+    const r = await snapRequest("POST", PACKAGE_CREDIT_PAGE_URL, cred, fetcher, query)
+    const list = asRecord(r.data).list
+    if (!r.ok || !Array.isArray(list)) continue
+    reached = true
+    for (const p of list) {
+      const metric = PACKAGE_TYPE_METRICS[asRecord(p).packageType]
+      if (!metric) continue
+      const amount = num(p.creditAmount)
+      batches.push({ metric, amount, left: Math.max(0, amount - num(p.creditUsed)), expiresAt: vendorDate(p.expiredTime) })
+    }
+  }
+  const overview = await snapRequest("GET", OPS_CREDIT_OVERVIEW_URL, cred, fetcher)
+  const campaigns = asRecord(overview.data).items
+  if (overview.ok && Array.isArray(campaigns)) {
+    reached = true
+    for (const c of campaigns) {
+      const left = num(c?.totalClaimed) - num(c?.totalConsumed) - num(c?.totalExpired)
+      if (left <= 0 || c.campaignId === undefined || c.campaignId === null) continue
+      const page = await snapRequest("GET", OPS_CREDIT_CAMPAIGN_URL(c.campaignId), cred, fetcher)
+      for (const b of Array.isArray(asRecord(page.data).benefits) ? page.data.benefits : []) {
+        const amount = num(b?.claimedAmount)
+        batches.push({
+          metric: PACKAGE_TYPE_METRICS.bonus,
+          amount,
+          left: Math.max(0, amount - num(b.consumedAmount) - num(b.expiredAmount)),
+          expiresAt: vendorDate(b.expireAt),
+        })
+      }
+    }
+  }
+  return reached ? batches : undefined
+}
+
+/**
+ * When the soonest still-good batch lapses, and what lapses that Beijing day
+ * (a sign-up grant and that day's check-in go a minute apart). Undefined when
+ * nothing is left to lapse.
+ */
+function soonestLapse(batches, now = Date.now()) {
+  const live = (batches ?? []).filter((b) => b.left > 0 && b.expiresAt > now)
+  if (live.length === 0) return undefined
+  const at = Math.min(...live.map((b) => b.expiresAt))
+  const day = beijingDay(at)
+  return { at, credit: live.filter((b) => beijingDay(b.expiresAt) === day).reduce((n, b) => n + b.left, 0) }
+}
+
+/** The plugin's own check-in ledger as batches, for when the vendor's can't be read. */
+const grantBatches = (grants) =>
+  (grants ?? []).map((g) => ({ metric: PACKAGE_TYPE_METRICS.bonus, amount: num(g.credit), left: num(g.credit), expiresAt: vendorDate(g.expiresAt) }))
+
 // ---- the check-in ledger -----------------------------------------------------
 //
 // CodeArts tells how many credits a bucket holds, never when each given batch
@@ -1630,22 +1717,45 @@ function parseAgentModel(m) {
 }
 
 /**
- * The CodeAgent's models (`agents/detail` → `gpts.models`), carrying each
- * model's credit rate. Its agent id comes from the account's agent list (the
- * one whose `original_id` is CodeAgent) and is kept on `state`.
+ * The agents to ask for a model list, best first: the account's main agent
+ * (`original_id` "build", else CodeAgent), the rest of its agents, then the
+ * IDE's own id for the main agent.
+ */
+async function agentCandidates(cred, fetcher) {
+  const root = safeJson(await signedGet(AGENT_LIST_URL, cred, fetcher, AGENT_CENTER_HEADERS) ?? "")
+  const agents = (Array.isArray(root?.agents) ? root.agents : Array.isArray(root?.data?.agents) ? root.data.agents : [])
+    .filter((a) => typeof a?.agent_id === "string" && a.agent_id)
+  const rank = (a) => {
+    const i = MAIN_AGENT_ORIGINAL_IDS.indexOf(firstOf(a.original_id) || a.agent_id)
+    return i < 0 ? MAIN_AGENT_ORIGINAL_IDS.length : i
+  }
+  const ids = [...agents].sort((a, b) => rank(a) - rank(b)).map((a) => a.agent_id)
+  return [...new Set([...ids, MAIN_AGENT_FALLBACK_ID])]
+}
+
+/**
+ * The main agent's models (`agents/detail` → `gpts.models`), carrying each
+ * model's credit rate. The agent that answered with a list is kept on `state`.
  */
 async function fetchAgentModels(cred, fetcher, state) {
-  if (!state.agentId) {
-    const root = safeJson(await signedGet(AGENT_LIST_URL, cred, fetcher, AGENT_CENTER_HEADERS) ?? "")
-    const agents = root?.agents ?? root?.data?.agents
-    if (Array.isArray(agents)) {
-      const hit = agents.find((a) => a?.original_id ? a.original_id === CODE_AGENT_ID : a?.agent_id === CODE_AGENT_ID)
-      state.agentId = firstOf(hit?.agent_id) || CODE_AGENT_ID
+  const read = async (id) => {
+    const root = safeJson(await signedGet(AGENT_DETAIL_URL(id), cred, fetcher, AGENT_CENTER_HEADERS) ?? "")
+    const models = root?.gpts?.models ?? root?.data?.gpts?.models
+    return Array.isArray(models) && models.length ? models.map(parseAgentModel).filter(Boolean) : undefined
+  }
+  if (state.agentId) {
+    const known = await read(state.agentId)
+    if (known) return known
+    state.agentId = ""
+  }
+  for (const id of (await agentCandidates(cred, fetcher)).slice(0, AGENT_DETAIL_TRIES)) {
+    const models = await read(id)
+    if (models) {
+      state.agentId = id
+      return models
     }
   }
-  const root = safeJson(await signedGet(AGENT_DETAIL_URL(state.agentId || CODE_AGENT_ID), cred, fetcher, AGENT_CENTER_HEADERS) ?? "")
-  const models = root?.gpts?.models ?? root?.data?.gpts?.models
-  return Array.isArray(models) ? models.map(parseAgentModel).filter(Boolean) : undefined
+  return undefined
 }
 
 /**
@@ -1697,8 +1807,9 @@ async function fetchRemoteModels(cred, fetcher, state) {
     if (mi) {
       if (a.rate > 0 && !mi.benefit) mi.rate = a.rate
       if (a.reasoning) mi.reasoning = true
-      mi.context ||= a.context || undefined
-      mi.output ??= a.output
+      // The limits the agent itself runs the model with.
+      if (a.context > 0) mi.context = a.context
+      if (a.output) mi.output = a.output
     } else if (!a.own && !a.hidden && !/-vl(-|$)/i.test(normalizeModelId(a.id))) {
       models.push({
         id: a.id,
@@ -1762,20 +1873,9 @@ function creditWindow(name, limit, remain, { resetsAt, expiring = 0 } = {}) {
 }
 
 // The buckets that are the month's allowance and come back at the period's
-// end (`end_date`, the IDE's 「等待至 {resetDate} 额度重置」); bought and given
-// credits run out on their own dates instead.
+// end (the IDE's 「等待至 {resetDate} 额度重置」); bought and given credits run
+// out on their own dates instead.
 const MONTHLY_CREDIT_METRICS = ["usageTotalPackageCredit", "usageBasicPackageCredit"]
-
-/**
- * When the soonest still-good check-in credits run out, and how many: each
- * claim the plugin made is good for 30 days. Undefined when none are left.
- */
-function soonestGrant(grants, now = Date.now()) {
-  const live = (grants ?? []).filter((g) => num(g.credit) > 0 && vendorDate(g.expiresAt) > now)
-  if (live.length === 0) return undefined
-  const at = Math.min(...live.map((g) => vendorDate(g.expiresAt)))
-  return { at, credit: live.filter((g) => vendorDate(g.expiresAt) === at).reduce((n, g) => n + num(g.credit), 0) }
-}
 
 /**
  * The free daily token pool as a window, scoped to the models that draw on it.
@@ -1803,10 +1903,13 @@ function benefitWindow(raw, ids = benefitModelIds) {
 
 /**
  * Map the account's `statistics/plugin` (+ free pool) answer to magpie's usage
- * shape. `grants` are the check-ins the plugin claimed for the account: the
- * soonest of them to lapse shows as the bonus bucket's `runsOutAt`/`runsOut`.
+ * shape. `batches` are its credit batches with their own expiry (see
+ * fetchCreditBatches): the plan's batch gives the month's reset to the second,
+ * and the soonest of the rest to lapse is each bucket's (and the total's)
+ * `runsOutAt`/`runsOut`. Without them, `grants` (the check-ins the plugin
+ * claimed, 30 days each) stand in, and the reset is `end_date`.
  */
-function usageFromStatistics(raw, benefitRaw, { grants, benefitIds } = {}) {
+function usageFromStatistics(raw, benefitRaw, { batches, grants, benefitIds } = {}) {
   let data = raw
   if (raw && typeof raw.code === "number") {
     if (raw.code !== 0) return { error: firstOf(raw.message, raw.msg, `CodeArts code ${raw.code}`), windows: [] }
@@ -1816,10 +1919,15 @@ function usageFromStatistics(raw, benefitRaw, { grants, benefitIds } = {}) {
   const pkg = asRecord(data.package)
   const plan = firstOf(pkg.package_name_cn, pkg.package_name_en, pkg.spec_code)
   const metrics = Array.isArray(data.metrics) ? data.metrics : []
-  const periodEnd = vendorDate(data.end_date)
-  const resetsAt = periodEnd ? new Date(periodEnd).toISOString() : undefined
+  const now = Date.now()
+  const known = batches ?? grantBatches(grants)
+  // The plan's own batch ends when the month's allowance comes back.
+  const planEnds = known.filter((b) => b.metric === PACKAGE_TYPE_METRICS.basic && b.expiresAt > now).map((b) => b.expiresAt)
+  const reset = planEnds.length ? Math.min(...planEnds) : vendorDate(data.end_date)
+  const resetsAt = reset ? new Date(reset).toISOString() : undefined
 
   const windows = []
+  const metricOf = new Map()
   for (const item of metrics) {
     const rec = asRecord(item)
     const name = CREDIT_METRIC_LABELS[rec.name]
@@ -1827,27 +1935,32 @@ function usageFromStatistics(raw, benefitRaw, { grants, benefitIds } = {}) {
     const limit = num(rec.package_credit_amount)
     const remain = num(rec.package_credit_remain)
     if (limit <= 0 && remain <= 0) continue // empty bucket, nothing to show
-    windows.push(creditWindow(name, limit, remain, {
+    const w = creditWindow(name, limit, remain, {
       resetsAt: MONTHLY_CREDIT_METRICS.includes(rec.name) ? resetsAt : undefined,
       expiring: num(rec.package_credit_expiring_amount),
-    }))
+    })
+    metricOf.set(w, rec.name)
+    windows.push(w)
+  }
+
+  // What lapses soonest, apart from the month's reset: a bucket's own
+  // batches; for the total, every batch but the plan's.
+  for (const w of windows) {
+    const metric = metricOf.get(w)
+    if (metric === PACKAGE_TYPE_METRICS.basic) continue
+    const own = known.filter((b) => (metric === TOTAL_CREDIT_METRIC ? b.metric !== PACKAGE_TYPE_METRICS.basic : b.metric === metric))
+    const lapse = soonestLapse(own, now)
+    const left = Math.max(0, w.limit - w.amount)
+    if (lapse && left > 0) {
+      w.runsOutAt = new Date(lapse.at).toISOString()
+      w.runsOut = Math.min(lapse.credit, left)
+    }
   }
 
   // Keep the package total on top, then the per-bucket breakdown, then the
   // separate free pool.
   const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
   windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
-
-  // Check-in credits are given into the bonus bucket and lapse 30 days on.
-  const soonest = soonestGrant(grants)
-  const holder = windows.find((w) => w.name === CREDIT_METRIC_LABELS.usageBonusPackageCredit) ?? windows.find((w) => w.name === totalLabel)
-  if (soonest && holder) {
-    const left = Math.max(0, holder.limit - holder.amount)
-    if (left > 0) {
-      holder.runsOutAt = new Date(soonest.at).toISOString()
-      holder.runsOut = Math.min(soonest.credit, left)
-    }
-  }
 
   const benefit = benefitRaw ? benefitWindow(benefitRaw, benefitIds) : undefined
   if (benefit) windows.push(benefit)
@@ -1875,7 +1988,10 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const accounts = new Map()
   const accountState = (key) => {
     if (!accounts.has(key)) {
-      accounts.set(key, { gate: createConcurrencyGate(maxInflight), benefit: null, noBenefit: new Set(), claim: null, claiming: null, agentId: "" })
+      accounts.set(key, {
+        gate: createConcurrencyGate(maxInflight), benefit: null, noBenefit: new Set(), claim: null, claiming: null, agentId: "",
+        batches: undefined, batchesAt: 0,
+      })
     }
     return accounts.get(key)
   }
@@ -2044,7 +2160,15 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           // effort either way: a credit account without one is normal.
           const free = state.benefit === null || state.benefit.size > 0
           const benefitText = free ? await signedGet(BENEFIT_BALANCE_URL, cred, fetcher) : undefined
+          // Each batch's own expiry, read again every ten minutes (and after a
+          // check-in); a failed read keeps the last one, else the ledger stands in.
+          if (!state.batchesAt || Date.now() - state.batchesAt > CREDIT_BATCHES_TTL_MS) {
+            const read = await fetchCreditBatches(cred, fetcher).catch(() => undefined)
+            if (read) state.batches = read
+            state.batchesAt = Date.now()
+          }
           const usage = usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText), {
+            batches: state.batches,
             grants: readGrants(ledgerPath, await ledgerKey(cred)),
             benefitIds: state.benefit ? [...state.benefit] : benefitModelIds,
           })
@@ -2061,8 +2185,12 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         const cred = credentialOf(await getAuth())
         if (!cred?.access_key_id) return { outcome: "failed", message: "not signed in" }
         const { grant, ...r } = await dailyCheckin(cred, fetcher)
-        // Kept so the usage card can tell when these credits run out.
-        if (r.outcome === "claimed" && grant) recordGrant(ledgerPath, await ledgerKey(cred), grant)
+        if (r.outcome === "claimed") {
+          // The new batch shows at the next usage read; the ledger keeps it in
+          // case the vendor's batch list can't be read.
+          ;(await stateOf(cred)).batchesAt = 0
+          if (grant) recordGrant(ledgerPath, await ledgerKey(cred), grant)
+        }
         return r
       },
 
@@ -2152,7 +2280,8 @@ export const _internal = {
   BENEFIT_CLAIM_URL, AGENT_LIST_URL, AGENT_DETAIL_URL, CODE_AGENT_ID,
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
   claimBenefit, ensureBenefitClaimed, parseAgentModel, fetchAgentModels,
-  readGrants, recordGrant, soonestGrant, grantExpiry,
+  readGrants, recordGrant, grantExpiry, grantBatches, soonestLapse, fetchCreditBatches,
+  PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
   toBytes, isBenefitModel, rememberBenefitIds, prepareChatBody, signedFetch, signedGet,
   parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, classifyHead,
   peekAnswer, completionFromChunks, createConcurrencyGate, delay, retryDelayMs,

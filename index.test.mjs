@@ -363,8 +363,94 @@ test("usageFromStatistics: the soonest check-in credits to lapse show on the bon
   const bonus = usage.windows.find((w) => w.name === "赠送积分包")
   assert.equal(bonus.runsOutAt, grants[1].expiresAt)
   assert.equal(bonus.runsOut, 1000)
-  assert.equal(usage.windows.find((w) => w.name === "总积分").runsOutAt, undefined)
-  assert.equal(x.soonestGrant([grants[0]]), undefined)
+  // The total loses them too.
+  assert.equal(usage.windows.find((w) => w.name === "总积分").runsOutAt, grants[1].expiresAt)
+  assert.equal(x.soonestLapse(x.grantBatches([grants[0]])), undefined)
+})
+
+// Shaped as the console's own answers (personal-usage → 获取明细).
+const day = 86_400_000
+const iso = (ms) => new Date(ms).toISOString()
+function creditFetcher(now = Date.now()) {
+  const planEnd = now + 31 * day
+  const signUp = now + 30 * day
+  const checkin = signUp + 52_000 // the same Beijing day, a minute later
+  const ok = (data) => new Response(JSON.stringify({ code: 0, message: "ok", data }), { status: 200 })
+  const fetcher = async (url, init) => {
+    const u = String(url)
+    const body = init?.body ? JSON.parse(new TextDecoder().decode(init.body)) : undefined
+    if (u === x.PACKAGE_CREDIT_PAGE_URL) {
+      const list = body.packageTypes.includes("basic")
+        ? [{ packageType: "basic", creditAmount: 500.0, creditUsed: 0.0, validityPeriod: "31", expiredTime: iso(planEnd).replace("Z", "+00:00"), status: 1 }]
+        : []
+      return new Response(JSON.stringify({ list, total: list.length, pageNum: 1, pageSize: 100 }), { status: 200 })
+    }
+    if (u === x.OPS_CREDIT_OVERVIEW_URL) {
+      return ok({ items: [
+        { campaignId: 4, campaignTitle: "新用户注册送 4000 积分", totalClaimed: 4000, totalConsumed: 0, totalExpired: 0 },
+        { campaignId: 1, campaignTitle: "每日签到领1000积分", totalClaimed: 1000, totalConsumed: 0, totalExpired: 0 },
+        { campaignId: 9, campaignTitle: "用完了", totalClaimed: 1000, totalConsumed: 1000, totalExpired: 0 },
+      ] })
+    }
+    if (u === x.OPS_CREDIT_CAMPAIGN_URL(4)) {
+      return ok({ campaignId: 4, benefits: [{ status: "CONFIRMED", claimedAmount: 4000, consumedAmount: 0, expiredAmount: 0, claimedAt: iso(signUp - 30 * day), expireAt: iso(signUp) }] })
+    }
+    if (u === x.OPS_CREDIT_CAMPAIGN_URL(1)) {
+      return ok({ campaignId: 1, expirePolicy: { strategy: "DURATION", duration: 30, durationUnit: "DAYS" }, benefits: [{ status: "CONFIRMED", claimedAmount: 1000, consumedAmount: 0, expiredAmount: 0, claimedAt: iso(checkin - 30 * day), expireAt: iso(checkin) }] })
+    }
+    throw new Error(`unexpected ${u}`)
+  }
+  return { fetcher, planEnd, signUp, checkin }
+}
+
+test("fetchCreditBatches reads every batch with its own expiry, signed", async () => {
+  const { fetcher, planEnd, signUp, checkin } = creditFetcher()
+  const seen = []
+  const batches = await x.fetchCreditBatches({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, async (url, init) => {
+    seen.push([init.method, String(url), new Headers(init.headers).get("authorization")])
+    return fetcher(url, init)
+  })
+  assert.deepEqual(batches, [
+    { metric: "usageBasicPackageCredit", amount: 500, left: 500, expiresAt: planEnd },
+    { metric: "usageBonusPackageCredit", amount: 4000, left: 4000, expiresAt: signUp },
+    { metric: "usageBonusPackageCredit", amount: 1000, left: 1000, expiresAt: checkin },
+  ])
+  // A spent campaign is not asked for its grants.
+  assert.equal(seen.some((s) => s[1] === x.OPS_CREDIT_CAMPAIGN_URL(9)), false)
+  assert.ok(seen.every((s) => String(s[2]).startsWith("SDK-HMAC-SHA256 ")))
+  // Nothing reached: no batches, so the caller falls back.
+  assert.equal(await x.fetchCreditBatches({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, async () => new Response("", { status: 401 })), undefined)
+})
+
+test("usage with the vendor's batches: the plan's end is the reset, the grants' the lapse", async () => {
+  const cred = await makeCred()
+  const { fetcher: credit, planEnd, signUp } = creditFetcher()
+  const fetcher = async (url, init) => {
+    if (String(url).endsWith("/snap-manager/v1/statistics/plugin")) {
+      return new Response(JSON.stringify({
+        end_date: "2099-01-01",
+        metrics: [
+          { name: "usageTotalPackageCredit", package_credit_amount: 5500, package_credit_remain: 5500 },
+          { name: "usageBasicPackageCredit", package_credit_amount: 500, package_credit_remain: 500 },
+          { name: "usageBonusPackageCredit", package_credit_amount: 5000, package_credit_remain: 5000 },
+        ],
+      }), { status: 200 })
+    }
+    if (String(url) === x.BENEFIT_BALANCE_URL) return new Response("", { status: 404 })
+    return credit(url, init)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, ledgerPath: path.join(ledgerDir, "unused.json") })
+  const usage = await plugin.auth.usage(async () => makeAuth(cred))
+  const [total, basic, bonus] = usage.windows
+  // To the second, from the plan's batch, not end_date's day.
+  assert.equal(total.resetsAt, iso(planEnd))
+  assert.equal(basic.resetsAt, iso(planEnd))
+  assert.equal(basic.runsOutAt, undefined, "the plan's credits come back, they don't lapse")
+  // The sign-up grant and that day's check-in lapse together.
+  assert.equal(bonus.runsOutAt, iso(signUp))
+  assert.equal(bonus.runsOut, 5000)
+  assert.equal(total.runsOutAt, iso(signUp))
+  assert.equal(total.runsOut, 5000)
 })
 
 test("the free pool window comes back at the next Beijing midnight", () => {
@@ -1036,6 +1122,41 @@ test("provider.models: free models once claimed, rates and parameters from the C
   }
 })
 
+test("the model list comes from the main agent: original_id build, then CodeAgent, then the IDE's id", async () => {
+  const cred = { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }
+  const detailOf = (models) => new Response(JSON.stringify({ gpts: { models } }), { status: 200 })
+  const glm = [{ model_name: "GLM-5.2", model_parameters: { model_id: "GLM-5.2", context_window: 1048576 }, credit: [{ ratio: 0.05, ratio_display: 0.7 }] }]
+  const run = async (agents, detail) => {
+    const asked = []
+    const state = {}
+    const models = await x.fetchAgentModels(cred, async (url) => {
+      const u = String(url)
+      if (u === x.AGENT_LIST_URL) return agents ? new Response(JSON.stringify({ total: agents.length, agents }), { status: 200 }) : new Response("", { status: 500 })
+      const id = new URL(u).searchParams.get("agent_id")
+      asked.push(id)
+      return detailOf(detail(id))
+    }, state)
+    return { models, asked, state }
+  }
+  // The account's own agents, as the IDE lists them: the main one is "build".
+  const agents = [
+    { agent_id: "9f0e5cb64a104dcfb4aa90dbedab7dcf", original_id: "team-leader" },
+    { agent_id: "a8bcb36232554267a5142361cc25a393", original_id: "build" },
+    { agent_id: "c0de", original_id: "CodeAgent" },
+  ]
+  let r = await run(agents, (id) => (id === "a8bcb36232554267a5142361cc25a393" ? glm : []))
+  assert.deepEqual(r.asked, ["a8bcb36232554267a5142361cc25a393"])
+  assert.equal(r.models[0].rate, 0.7)
+  assert.equal(r.state.agentId, "a8bcb36232554267a5142361cc25a393")
+  // An agent with an empty list: the next one is asked.
+  r = await run(agents, (id) => (id === "c0de" ? glm : []))
+  assert.deepEqual(r.asked, ["a8bcb36232554267a5142361cc25a393", "c0de"])
+  // No agent list at all: the IDE's own id for the main agent.
+  r = await run(undefined, (id) => (id === "a8bcb36232554267a5142361cc25a393" ? glm : []))
+  assert.deepEqual(r.asked, ["a8bcb36232554267a5142361cc25a393"])
+  assert.equal(r.models[0].context, 1048576)
+})
+
 test("a benefit the account can't claim: no free models, and no benefit header", async () => {
   const before = [...x.BENEFIT_MODEL_FALLBACK]
   try {
@@ -1096,6 +1217,8 @@ test("auth.usage reports the plan's credit window (the free pool is best-effort)
   const fetcher = async (url) => {
     asked.push(String(url))
     if (String(url) === x.BENEFIT_BALANCE_URL) return new Response("nope", { status: 404 })
+    // The batch reads fail here: the usage read goes on without them.
+    if (String(url) === x.PACKAGE_CREDIT_PAGE_URL || String(url) === x.OPS_CREDIT_OVERVIEW_URL) return new Response("", { status: 500 })
     assert.ok(String(url).endsWith("/snap-manager/v1/statistics/plugin"))
     return new Response(JSON.stringify({
       package: { package_name_cn: "企业版" },
@@ -1108,7 +1231,10 @@ test("auth.usage reports the plan's credit window (the free pool is best-effort)
   assert.deepEqual(usage.windows, [
     { name: "总积分", used: 60, display: "600 / 1000", amount: 600, limit: 1000, unit: "credits" },
   ])
-  assert.deepEqual(asked, [x.SNAP_STATISTICS_URL, x.BENEFIT_BALANCE_URL])
+  assert.deepEqual(asked, [x.SNAP_STATISTICS_URL, x.BENEFIT_BALANCE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.PACKAGE_CREDIT_PAGE_URL, x.OPS_CREDIT_OVERVIEW_URL])
+  // Read again within ten minutes: the batches aren't.
+  await plugin.auth.usage(async () => makeAuth(cred))
+  assert.equal(asked.filter((u) => u === x.OPS_CREDIT_OVERVIEW_URL).length, 1)
 })
 
 // ---- daily check-in ----------------------------------------------------------

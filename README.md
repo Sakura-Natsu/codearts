@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-76%20passing-success)
+![tests](https://img.shields.io/badge/tests-79%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -99,25 +99,31 @@ magpie 侧：在 **设置 → 用量 → Plugins** 打开 CodeArts 的「每日�
     重发，并记住该账号不再给它加头。带日期后缀的 id 才是免费模型，去掉后缀的  
     `deepseek-v4-flash` 是另一个按积分计费的模型。
 -   **倍率（消耗系数）**：取自码道客户端自己的模型列表  
-    （`/v1/agent-center/agents/detail` 中 CodeAgent 的 `gpts.models[].credit[].ratio_display`），  
+    （`/v1/agent-center/agents/detail` 中主智能体「build」的 `gpts.models[].credit[].ratio_display`），  
     以 magpie 的 `rate` 字段上报；同一份列表还给出是否为推理模型、上下文与输出上限。免费  
     模型不显示倍率。
--   **积分有效期**：码道接口只给出每个积分桶的余额与「即将过期」数量，不给每批积分的  
-    过期日。插件能给出的是：
-    -   「总积分」「基础积分包」是月度配额，重置时间取 `statistics/plugin` 的 `end_date`  
-        （即客户端「等待至 {resetDate} 额度重置」的日期）；
+-   **积分有效期**：读的是码道控制台「套餐与用量 → 获取明细」同一批接口，每批积分都有  
+    自己的到期时间：
+    -   套餐 / 按需积分包：`POST /snap-manager/v1/package/credit/page`（`expiredTime`）；
+    -   活动福利（注册赠送、每日签到等）：`GET /v1/ops/credit/overview` 列出活动，再  
+        `GET /v1/ops/credit/campaign/{id}` 读每一笔的 `expireAt`。
+
+    用量卡片上：
+    -   「总积分」「基础积分包」是月度配额，重置时间取订阅套餐那一批的到期时间（精确到秒；  
+        读不到时退回 `statistics/plugin` 的 `end_date`）；
+    -   「赠送积分包」「按需积分包」显示最早一批何时过期、过期多少（同一天到期的几批合在  
+        一起算）；「总积分」也显示这个时间（不含会重置的套餐积分）；
     -   各积分桶的 `package_credit_expiring_amount` 写在说明里（「N 即将过期」）；
-    -   签到积分自发放起 30 天有效：插件每次签到成功都会记一笔到  
-        `~/.config/magpie/codearts-checkins.json`（可用环境变量 `MAGPIE_CODEARTS_LEDGER`  
-        改路径），用量卡片上「赠送积分包」会显示最早一批签到积分何时过期、过期多少。在  
-        码道客户端里手动领取的那几天不在其中。
     -   「免费额度」是每日池，北京时间零点重置。
 
-    > ⚠️ **有效期这部分尚未用真实账号验证，显示的时间可能不准确。** 依据都是从码道客户端  
-    > 代码推断的：`end_date` 的具体格式没见过实际数据（只有日期时按北京时间当天零点处理，  
-    > 可能比实际重置时间早或晚一天）；`package_credit_expiring_amount` 客户端读了却从不显示，  
-    > 含义不确定；签到积分「30 天有效」取自活动规则，若领取结果里带了过期时间字段则以它为准。  
-    > 请以码道控制台显示为准，发现不一致欢迎反馈。
+    批次每 10 分钟读一次（签到后立即刷新）。若这些接口读不到，插件退回自己的签到账本  
+    `~/.config/magpie/codearts-checkins.json`（可用环境变量 `MAGPIE_CODEARTS_LEDGER` 改路径；  
+    每次签到成功记一笔，按「自领取起 30 天」算到期），这时注册赠送等其他批次没有到期时间。
+
+    > ⚠️ **有效期这部分仍待更多真实数据验证。** 接口与字段是对照码道控制台页面的实际请求  
+    > 确认的（签到积分「领取后 30 天到期」与控制台一致），但插件用 AK/SK 签名调用这些接口  
+    > 尚未在真实账号上跑过，账号多批积分、部分消耗后的显示也还没验证过。请以码道控制台  
+    > 显示为准，发现不一致欢迎反馈。
 -   **用量**：读取 `snap-manager/v1/statistics/plugin` 的积分口径，「总积分」决定账号是否  
     可用，基础 / 按需 / 赠送积分包只做明细展示（`aside`）；另读  
     `opengw .../user/tokens/balance` 显示「免费额度」（每日 token 池，只统计免费模型）。
@@ -188,13 +194,14 @@ The plugin implements magpie's `auth.checkin` hook with the same three calls the
 - **Free models** are the account's live `gateway/config` list, and only once today's benefit has been claimed
   (`POST /api/v1/benefit/claim`, once a Beijing day, as the CodeArts agent does); a `benefit not found` answer for
   a model the account also lists as a builtin model is sent again without the benefit header (billed as credits).
-- **Credit rates** (the IDE's 消耗系数) come from the CodeAgent's own model list
+- **Credit rates** (the IDE's 消耗系数) come from the main agent's ("build") own model list
   (`/v1/agent-center/agents/detail` → `credit[].ratio_display`) and are reported as magpie's `rate`.
-- **Credit expiry.** CodeArts reports balances, not per-batch expiry dates. The monthly buckets show their reset
-  (`end_date`), each bucket's "expiring" amount is in its display text, and check-in credits (good for 30 days) are
-  kept in a small ledger (`~/.config/magpie/codearts-checkins.json`, or `MAGPIE_CODEARTS_LEDGER`) so the bonus
-  bucket shows when the soonest of them runs out. **Not yet verified against a real account** — the dates are
-  inferred from the CodeArts client's code and may be off; trust the CodeArts console where they differ.
+- **Credit expiry.** Read from the same calls as the CodeArts console's 获取明细 tab: package batches
+  (`POST /snap-manager/v1/package/credit/page`, `expiredTime`) and campaign grants (`/v1/ops/credit/overview` →
+  `/v1/ops/credit/campaign/{id}`, `expireAt`). The monthly buckets reset when the plan's batch ends; the bonus and
+  on-demand buckets (and the total) show when their soonest batch lapses and how much. When those calls can't be
+  read, a local check-in ledger (`~/.config/magpie/codearts-checkins.json`, or `MAGPIE_CODEARTS_LEDGER`; 30 days
+  per claim) stands in. **Still to be verified on more real accounts** — trust the CodeArts console where they differ.
 - **Metering.** CodeArts meters only streamed answers, so every chat goes upstream as a stream and is folded
   back into a plain `chat.completion` when the caller asked for JSON. Usage is billed as normal.
 - **Reasoning.** The plugin sends `thinking: { type: "enabled" }` unless the caller set it, so reasoning
