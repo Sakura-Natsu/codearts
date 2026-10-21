@@ -516,6 +516,8 @@ async function requestToken(body, keyPair, fetcher) {
       method: "POST",
       headers: { DPoP: dpop, "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(body).toString(),
+      // A 307/308 would send the refresh token and verifier on with the body.
+      redirect: "error",
       signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
     })
   } catch (e) {
@@ -1145,16 +1147,9 @@ function queueInfoOf(headers) {
 /** One signed call on a queued trace: GET is where it stands, DELETE takes it out. */
 async function traceQueueCall(method, cred, traceId, context, signal) {
   const url = TRACE_QUEUE_URL(traceId)
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    method, url, new Uint8Array(),
-  )
-  const headers = new Headers()
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
-  })
+  const headers = await signFor(cred, method, url, new Uint8Array())
   headers.set(SESSION_HEADER, context.sessionId)
-  return context.fetcher(url, { method, headers, signal })
+  return context.fetcher(url, { method, headers, signal, redirect: "error" })
 }
 
 /** The caller's signal, bounded to `ms` from now: a call that hangs can't outlast the wait it is part of. */
@@ -1224,6 +1219,29 @@ function isSignedHostUrl(url) {
   }
 }
 
+const refusalTo = (url) =>
+  `refusing to sign a request to ${hostOf(url) || "an unknown host"}: only CodeArts' own hosts (${[...SIGNED_HOSTS].join(", ")}) get the account's credentials`
+
+/**
+ * The SDK-HMAC-SHA256 headers for one request (all but `host`, which fetch
+ * sets), signed only for SIGNED_HOSTS: whichever route asks, now or added
+ * later, the account's credentials sign nothing else. Every signed call also
+ * goes with `redirect: "error"`: a redirect would forward the security token
+ * to wherever it points.
+ */
+async function signFor(cred, method, url, body, extraSigned) {
+  if (!isSignedHostUrl(url)) throw new Error(refusalTo(url))
+  const signed = await signRequestHuawei(
+    cred.access_key_id, cred.secret_access_key, cred.security_token,
+    method, url, body, extraSigned,
+  )
+  const headers = new Headers()
+  signed.forEach((value, key) => {
+    if (key !== "host") headers.set(key, value)
+  })
+  return headers
+}
+
 /** Mark a 401/403 the way magpie reads a sign-in that is gone. */
 function withSignInMark(res) {
   if (res.status !== 401 && res.status !== 403) return res
@@ -1254,9 +1272,7 @@ function withSignInMark(res) {
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
   const url = req ? req.url : String(input)
-  if (!isSignedHostUrl(url)) {
-    return errorResponse(400, "", `refusing to sign a request to ${hostOf(url) || "an unknown host"}: only CodeArts' own hosts (${[...SIGNED_HOSTS].join(", ")}) get the account's credentials`)
-  }
+  if (!isSignedHostUrl(url)) return errorResponse(400, "", refusalTo(url))
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const baseHeaders = new Headers(init?.headers ?? req?.headers)
   let body
@@ -1273,16 +1289,11 @@ async function signedFetch(cred, input, init, context) {
 
   let active = cred
   const send = async () => {
-    const signed = await signRequestHuawei(
-      active.access_key_id, active.secret_access_key, active.security_token,
-      method, url, body, extra,
-    )
+    const signed = await signFor(active, method, url, body, extra)
     const headers = new Headers(baseHeaders)
     // The body may have been reshaped: the transport counts it again.
     headers.delete("content-length")
-    signed.forEach((value, key) => {
-      if (key !== "host") headers.set(key, value)
-    })
+    signed.forEach((value, key) => headers.set(key, value))
     headers.set("Chat-Id", context.chatId)
     headers.set("Session-Id", context.sessionId)
     // The session headers the CodeArts agent sends: one session per account,
@@ -1300,6 +1311,8 @@ async function signedFetch(cred, input, init, context) {
       headers,
       ...(body.length > 0 ? { body } : {}),
       ...(signal ? { signal } : {}),
+      // After the caller's init, so no caller turns it back on.
+      redirect: "error",
     })
   }
 
@@ -1405,19 +1418,10 @@ async function signedFetch(cred, input, init, context) {
 
 /** A signed GET returning the response text, or undefined on any failure. */
 async function signedGet(url, cred, fetcher, extraUnsignedHeaders) {
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    "GET", url, new Uint8Array(),
-  )
-  const headers = new Headers()
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
-  })
-  if (extraUnsignedHeaders !== undefined) {
-    for (const [k, v] of Object.entries(extraUnsignedHeaders)) headers.set(k, v)
-  }
   try {
-    const res = await fetcher(url, { method: "GET", headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const headers = await signFor(cred, "GET", url, new Uint8Array())
+    for (const [k, v] of Object.entries(extraUnsignedHeaders ?? {})) headers.set(k, v)
+    const res = await fetcher(url, { method: "GET", headers, redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     if (!res.ok) return undefined
     return await res.text()
   } catch {
@@ -1444,19 +1448,13 @@ async function snapRequest(method, url, cred, fetcher, payload) {
   let res
   let text
   try {
-    const signed = await signRequestHuawei(
-      cred.access_key_id, cred.secret_access_key, cred.security_token,
-      method, url, body,
-    )
-    const headers = new Headers()
-    signed.forEach((value, key) => {
-      if (key !== "host") headers.set(key, value)
-    })
+    const headers = await signFor(cred, method, url, body)
     for (const [k, v] of Object.entries(SNAP_EXTRA_HEADERS)) headers.set(k, v)
     res = await fetcher(url, {
       method,
       headers,
       ...(payload === undefined ? {} : { body }),
+      redirect: "error",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     text = await res.text()
@@ -1581,6 +1579,13 @@ function readGrants(file, account) {
   return Array.isArray(list) ? list : []
 }
 
+function writeLedger(file, all) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const tmp = `${file}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(all, null, 2))
+  fs.renameSync(tmp, file)
+}
+
 /** Keep one claim (one a Beijing day), dropping what lapsed long ago. */
 function recordGrant(file, account, grant) {
   try {
@@ -1590,10 +1595,35 @@ function recordGrant(file, account, grant) {
     const list = (Array.isArray(all[account]) ? all[account] : [])
       .filter((g) => (vendorDate(g.expiresAt) ?? 0) > keep && beijingDay(vendorDate(g.at) ?? 0) !== day)
     all[account] = [...list, grant]
-    fs.mkdirSync(path.dirname(file), { recursive: true })
-    const tmp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(all, null, 2))
-    fs.renameSync(tmp, file)
+    writeLedger(file, all)
+  } catch {
+    /* best effort */
+  }
+}
+
+// The claim this plugin made today whose confirm failed, per account: the
+// next check-in confirms it, whichever magpie (or OpenCode) on this machine
+// runs it. A claim the IDE leaves unconfirmed (`id: null`) is never kept
+// here, so it is never confirmed. Kept for its Beijing day only.
+const UNCONFIRMED = "_unconfirmed"
+
+/** Today's claim this plugin left unconfirmed for `account`, if any. */
+function readUnconfirmed(file, account) {
+  const left = asRecord(asRecord(readLedger(file)[UNCONFIRMED])[account])
+  return left.day === beijingDay() ? left : undefined
+}
+
+/** Keep the claim left unconfirmed for `account`, or with null drop it; other days' go. */
+function recordUnconfirmed(file, account, left) {
+  try {
+    const all = readLedger(file)
+    const today = beijingDay()
+    const kept = Object.fromEntries(
+      Object.entries(asRecord(all[UNCONFIRMED])).filter(([k, v]) => k !== account && asRecord(v).day === today),
+    )
+    if (left) kept[account] = { ...left, day: today }
+    all[UNCONFIRMED] = kept
+    writeLedger(file, all)
   } catch {
     /* best effort */
   }
@@ -1613,21 +1643,25 @@ function grantExpiry(benefit, at) {
  * list the activities, claim the `USER_LOGIN` one with `{campaignId, channel}`,
  * and confirm it when the claim answers an id (`benefit.id !== null`), or the
  * credits stay pending. Answers magpie's check-in outcome; never throws.
+ * `unconfirmed` is today's claim this plugin left unconfirmed (the ledger's);
+ * an answer's own `unconfirmed` is one to keep there.
  */
-async function dailyCheckin(cred, fetcher) {
+async function dailyCheckin(cred, fetcher, { unconfirmed } = {}) {
   const first = await dailyCampaign(cred, fetcher)
   if (first.error) return { outcome: "failed", message: first.error }
   const item = first.item
   if (!item) return { outcome: "inactive", message: "当前没有每日领取活动" }
   const credit = num(item.benefitAmount)
-  // Claimed but never confirmed (a confirm that failed): confirm it now, or
-  // the credits stay pending. When the confirm fails, only the activity
-  // itself tells whether it was confirmed after all; still claimed, it is a
+  // Claimed here, but the confirm failed: confirm it now, or the credits stay
+  // pending. Only that claim: one the IDE leaves unconfirmed is `CLAIMED` as
+  // well, and the IDE never confirms it. When the confirm fails, only the
+  // activity tells whether it was confirmed after all; still claimed, it is a
   // failure magpie tries again later that day.
   const campaign = item.campaignId !== undefined && item.campaignId !== null && item.campaignId !== ""
-  if (!item.claimable && item.status === "CLAIMED" && campaign) {
+  const leftHere = unconfirmed && String(unconfirmed.campaignId) === String(item.campaignId)
+  if (!item.claimable && item.status === "CLAIMED" && campaign && leftHere) {
     const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
-    if (confirmed.ok) return claimedOutcome({}, credit)
+    if (confirmed.ok) return claimedOutcome(asRecord(unconfirmed.benefit), credit)
     const again = await dailyCampaign(cred, fetcher)
     if (isClaimedToday(again.item) && again.item.status !== "CLAIMED") return { outcome: "done", message: "今天已领取" }
     return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
@@ -1646,7 +1680,9 @@ async function dailyCheckin(cred, fetcher) {
   const benefit = asRecord(claimed.data)
   if (claimed.data && benefit.id !== null) {
     const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
-    if (!confirmed.ok) return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
+    if (!confirmed.ok) {
+      return { outcome: "failed", message: `领取确认失败：${confirmed.message}`, unconfirmed: { campaignId: item.campaignId, benefit } }
+    }
   }
   return claimedOutcome(benefit, credit)
 }
@@ -1702,16 +1738,9 @@ function extractArray(text, path) {
 async function claimBenefit(cred, fetcher) {
   const body = utf8("{}")
   try {
-    const signed = await signRequestHuawei(
-      cred.access_key_id, cred.secret_access_key, cred.security_token,
-      "POST", BENEFIT_CLAIM_URL, body,
-    )
-    const headers = new Headers()
-    signed.forEach((value, key) => {
-      if (key !== "host") headers.set(key, value)
-    })
+    const headers = await signFor(cred, "POST", BENEFIT_CLAIM_URL, body)
     headers.set("x-snap-traceid", randomHex(16))
-    const res = await fetcher(BENEFIT_CLAIM_URL, { method: "POST", headers, body, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const res = await fetcher(BENEFIT_CLAIM_URL, { method: "POST", headers, body, redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     const data = safeJson(await res.text())
     const code = firstOf(String(data?.error_code ?? "")) || `HTTP ${res.status}`
     return { ok: code === BENEFIT_OK, code, message: firstOf(data?.error_msg, data?.message) }
@@ -2043,14 +2072,15 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   // gateway/config was read; the fallback stands until then), its builtin
   // ones, and the ones the gateway said it has no benefit for; today's
   // benefit claim; its main agent's id; its credit batches; the renewal of its
-  // credential under way, and the last one made.
+  // credential under way, and the last one made; today's check-in claim whose
+  // confirm failed.
   const accounts = new Map()
   const accountState = (key) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
         gate: createConcurrencyGate(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
         claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
-        renewing: null, renewed: null,
+        renewing: null, renewed: null, unconfirmed: null,
       })
     }
     return accounts.get(key)
@@ -2277,12 +2307,29 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async checkin(getAuth) {
         const cred = credentialOf(await getAuth())
         if (!cred?.access_key_id) return { outcome: "failed", message: "not signed in" }
-        const { grant, ...r } = await dailyCheckin(cred, fetcher)
+        const key = await ledgerKey(cred)
+        const state = await stateOf(cred)
+        const today = beijingDay()
+        // The account's own memory first: the ledger is written best effort,
+        // and a write that failed mustn't lose the claim; the ledger carries it
+        // to another process, or past a restart.
+        const held = state.unconfirmed?.day === today ? state.unconfirmed : undefined
+        const left = held ?? readUnconfirmed(ledgerPath, key)
+        const { grant, unconfirmed, ...r } = await dailyCheckin(cred, fetcher, { unconfirmed: left })
+        // A claim whose confirm failed is kept for the next check-in; one
+        // confirmed now, or found done, is dropped.
+        if (unconfirmed) {
+          state.unconfirmed = { ...unconfirmed, day: today }
+          recordUnconfirmed(ledgerPath, key, unconfirmed)
+        } else if (left && r.outcome !== "failed") {
+          state.unconfirmed = null
+          recordUnconfirmed(ledgerPath, key, null)
+        }
         if (r.outcome === "claimed") {
           // The new batch shows at the next usage read; the ledger keeps it in
           // case the vendor's batch list can't be read.
-          ;(await stateOf(cred)).batchesAt = 0
-          if (grant) recordGrant(ledgerPath, await ledgerKey(cred), grant)
+          state.batchesAt = 0
+          if (grant) recordGrant(ledgerPath, key, grant)
         }
         return r
       },
@@ -2369,11 +2416,11 @@ export const _internal = {
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   isDeadRefreshToken, isPermanentRefreshFailure, nearExpiry, persistCredential,
   buildOAuthLoginUrl, buildPortalLoginResultUrl,
-  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isSignedHostUrl, hostOf, SIGNED_HOSTS,
+  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isSignedHostUrl, hostOf, SIGNED_HOSTS, signFor, traceQueueCall,
   BENEFIT_CLAIM_URL, AGENT_LIST_URL, AGENT_DETAIL_URL, CODE_AGENT_ID,
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
   claimBenefit, ensureBenefitClaimed, parseAgentModel, fetchAgentModels,
-  readGrants, recordGrant, grantExpiry, grantBatches, soonestLapse, fetchCreditBatches,
+  readGrants, recordGrant, readUnconfirmed, recordUnconfirmed, grantExpiry, grantBatches, soonestLapse, fetchCreditBatches,
   PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
   toBytes, isBenefitModel, prepareChatBody, signedFetch, signedGet,
   parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, classifyHead,
