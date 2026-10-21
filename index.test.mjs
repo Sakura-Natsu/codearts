@@ -1,4 +1,5 @@
-// Unit tests for the CodeArts OAuth plugin. Run with: node --test
+// Unit tests for the CodeArts OAuth plugin. Run with: bun test (node --test
+// runs them too).
 //
 // These tests exercise the pieces magpie calls (_internal helpers) and the
 // hooks the plugin returns, with the network stubbed out via `options.fetch`.
@@ -6,6 +7,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 
@@ -151,6 +153,21 @@ test("signRequestHuawei is deterministic for a fixed date stamp", async () => {
   assert.equal(a.get("Authorization"), b.get("Authorization"))
 })
 
+test("signRequestHuawei matches an independent SDK-HMAC-SHA256 implementation", async () => {
+  // A known answer, from an independent (Python) SDK-HMAC-SHA256: an unsorted
+  // query, a signed extra header, a URI that needs its trailing slash. Signing
+  // the wrong hash, dropping the slash or the query order all change it.
+  const signed = await x.signRequestHuawei(
+    "AK", "SK", "ST", "POST", "https://example.com/api/v2/chat/completions?b=2&a=1",
+    buf('{"m":1}'), { maas_type: "benefit" }, "20260101T000000Z",
+  )
+  assert.equal(
+    signed.get("Authorization"),
+    "SDK-HMAC-SHA256 Access=AK,SignedHeaders=content-type;host;maas_type;x-sdk-content-sha256;x-sdk-date;x-security-token,"
+      + "Signature=f33e9f9e8fa23cb4dbac42f858e310657f72cc67179a098e0b3a2fa9a693e161",
+  )
+})
+
 // ---- helpers ---------------------------------------------------------------
 
 test("normalizeModelId strips only a trailing 4-digit date", () => {
@@ -195,6 +212,9 @@ test("prepareChatBody reshapes a chat into what the gateway accepts and meters",
   assert.equal(x.prepareChatBody(null), null)
 })
 
+// The free model's TPM limit, word for word as the gateway sent it in a 200.
+const tpmEvent = 'data:{"text":"[DONE]","error_code":"InferHub.ModelArts.81111.429","error_msg":"The model TPM limit has been significantly exceeded. Please reduce the request rate and retry later."}'
+
 test("classifyHead tells an answer from an embedded error", () => {
   const role = `data: ${JSON.stringify({ choices: [{ delta: { role: "assistant" } }] })}\n\n`
   const content = `data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`
@@ -205,12 +225,22 @@ test("classifyHead tells an answer from an embedded error", () => {
   assert.equal(x.classifyHead(`data: {"error_code":"TM.00001041"`, false), undefined) // not whole yet
   assert.equal(x.classifyHead("", true), "answer")
   assert.equal(x.classifyHead(JSON.stringify({ choices: [{ message: { content: "x" } }] }), true), "answer")
+  // The free model's TPM limit, as the gateway sends it: no space after
+  // `data:`, a code of several parts, and a "[DONE]" that is no end.
+  assert.equal(x.classifyHead(`${tpmEvent}\n\n`, false), "InferHub.ModelArts.81111.429")
+  assert.equal(x.classifyHead(`data: ${JSON.stringify({ text: "[DONE]" })}\n\n`, false), undefined)
+  assert.equal(x.classifyHead(role + "data: [DONE]\n\n", false), "answer")
 })
 
 test("errorCodeOf / errorMessageOf / isRateLimitCode read the gateway's errors", () => {
   const text = '{"error_code":"InferHub.4291.200","error_msg":"insufficient \\"quota\\""}'
   assert.equal(x.errorCodeOf(text), "InferHub.4291.200")
   assert.equal(x.errorMessageOf(text), 'insufficient "quota"')
+  for (const code of ["InferHub.ModelArts.81111.429", "TM.00001041", "APIG.0602", "81114.429", "STS5.1806"]) {
+    assert.equal(x.errorCodeOf(`{"error_code":"${code}"}`), code)
+  }
+  assert.equal(x.errorCodeOf('{"code":"build"}'), "", "a word is no code")
+  assert.equal(x.isRateLimitCode("InferHub.ModelArts.81111.429"), true)
   assert.equal(x.isRateLimitCode("InferHub.4291.200"), true)
   assert.equal(x.isRateLimitCode("81111.429"), true)
   assert.equal(x.isRateLimitCode("InferHub.002002009.404"), false)
@@ -488,6 +518,17 @@ test("isBenefitModel honours the static fallback and the host's prefix", () => {
   assert.equal(x.isBenefitModel("GLM-5.2"), false)
 })
 
+test("isBenefitModel / isRegularModel read the account's own lists once it has them", () => {
+  const state = { benefit: new Set(["glm-5.3-flash"]), regular: new Set(["GLM-5.2"]), noBenefit: new Set() }
+  assert.equal(x.isBenefitModel("deepseek-v4.1-flash", state), false, "the fallback no longer stands")
+  assert.equal(x.isBenefitModel("glm-5.3-flash", state), true)
+  state.noBenefit.add("glm-5.3-flash")
+  assert.equal(x.isBenefitModel("glm-5.3-flash", state), false)
+  assert.equal(x.isRegularModel("GLM-5.2", state), true)
+  assert.equal(x.isRegularModel("glm-5.3-flash", state), false)
+  assert.equal(x.isRegularModel("anything", { regular: null }), true, "not known yet")
+})
+
 // ---- remote model list -----------------------------------------------------
 
 const gatewayBody = JSON.stringify({
@@ -698,11 +739,18 @@ test("a session cap that outlasts the budget comes back as a 429 magpie fails ov
     calls += 1
     return new Response(capBody, { status: 400 })
   }
-  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, retryDelays: [5], retryBudgetMs: 12 })
+  // A virtual clock that moves only when the plugin sleeps: however slow the
+  // signing is, the budget is spent by the waits alone.
+  let t = 0
+  const now = () => t
+  const sleep = async (ms) => { t += ms }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, retryDelays: [10], retryBudgetMs: 13, now, sleep })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
   const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
   assert.equal(res.status, 429)
-  assert.ok(calls >= 2)
+  // A wait is 10 ms ±20%: one (8–12) always fits the 13 ms budget, two (≥ 16)
+  // never do. So exactly one retry, whatever the jitter.
+  assert.equal(calls, 2)
   const body = await res.json()
   assert.equal(body.error.code, "TM.00001041")
   assert.match(body.error.message, /并发会话数已达上限/)
@@ -742,6 +790,19 @@ test("an error inside a 200 becomes a status magpie acts on, with the vendor's w
   assert.equal(body.error.message.startsWith("CodeArts"), false, "magpie adds the provider name itself")
 })
 
+test("the free model's TPM limit inside a 200 is a 429 magpie fails over on, not an empty reply", async () => {
+  const cred = await makeCred()
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => sseResponse(`${tpmEvent}\n\n`) })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  for (const stream of [true, false]) {
+    const res = await loaded.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [{ role: "user", content: "你好" }], stream }))
+    assert.equal(res.status, 429)
+    const body = await res.json()
+    assert.equal(body.error.code, "InferHub.ModelArts.81111.429")
+    assert.match(body.error.message, /TPM limit/)
+  }
+})
+
 test("embeddedErrorStatus sorts the gateway's codes into what magpie acts on", () => {
   assert.equal(x.embeddedErrorStatus("InferHub.4291.200"), 429)
   assert.equal(x.embeddedErrorStatus("81114.429"), 429)
@@ -771,53 +832,89 @@ test("every chat carries the agent's session headers: one session, a fresh trace
   assert.notEqual(a.get("x-snap-traceid"), b.get("x-snap-traceid"))
 })
 
+const signedCred = { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }
+
 test("only the account's live free list decides the benefit header", async () => {
-  const before = [...x.BENEFIT_MODEL_FALLBACK]
-  try {
-    const fetcher = async (url) => String(url).includes("opengw")
-      ? new Response(JSON.stringify({ result: { models: [{ model_id: "glm-5.3-flash" }] } }), { status: 200 })
-      : new Response(JSON.stringify({ builtinModels: [{ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek-V4.1-Flash" }] }), { status: 200 })
-    const models = await x.fetchRemoteModels({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, fetcher)
-    assert.deepEqual(models.map((m) => [m.id, m.benefit === true]), [["glm-5.3-flash", true], ["deepseek-v4.1-flash", false]])
-    // In the fallback, but this account lists it as a plain builtin model.
-    assert.equal(x.isBenefitModel("deepseek-v4.1-flash"), false)
-    assert.equal(x.isBenefitModel("glm-5.3-flash"), true)
-    // A failed read keeps what was known.
-    await x.fetchRemoteModels({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, async () => new Response("", { status: 500 }))
-    assert.equal(x.isBenefitModel("glm-5.3-flash"), true)
-  } finally {
-    x.rememberBenefitIds(before)
+  const state = {}
+  const fetcher = async (url) => String(url).includes("opengw")
+    ? new Response(JSON.stringify({ result: { models: [{ model_id: "glm-5.3-flash" }] } }), { status: 200 })
+    : new Response(JSON.stringify({ builtinModels: [{ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek-V4.1-Flash" }] }), { status: 200 })
+  // The claim answers with the gateway's own body here, so it is no 0000: read
+  // the published list as it is (no state), then check the account's lists.
+  const models = await x.fetchRemoteModels(signedCred, fetcher)
+  assert.deepEqual(models.map((m) => [m.id, m.benefit === true]), [["glm-5.3-flash", true], ["deepseek-v4.1-flash", false]])
+  const claimed = async (url, init) => (String(url) === x.BENEFIT_CLAIM_URL ? new Response('{"error_code":"0000"}', { status: 200 }) : fetcher(url, init))
+  await x.fetchRemoteModels(signedCred, claimed, state)
+  // In the fallback, but this account lists it as a plain builtin model.
+  assert.equal(x.isBenefitModel("deepseek-v4.1-flash", state), false)
+  assert.equal(x.isBenefitModel("glm-5.3-flash", state), true)
+  assert.deepEqual([...state.regular], ["deepseek-v4.1-flash"])
+  // A failed read keeps what was known.
+  await x.fetchRemoteModels(signedCred, async () => new Response("", { status: 500 }), state)
+  assert.equal(x.isBenefitModel("glm-5.3-flash", state), true)
+})
+
+test("one account's model lists never decide another's", async () => {
+  // Two accounts in one plugin: A has the free model, B lists it only as builtin.
+  const credA = await makeCred()
+  const credB = { ...(await makeCred()), access_key_id: "AKB", session_id: "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0" }
+  const listFor = (ak) => async (url, init) => {
+    const u = String(url)
+    if (u === x.BENEFIT_CLAIM_URL) return new Response(JSON.stringify({ error_code: ak === "AK" ? "0000" : "4004" }), { status: 200 })
+    if (u.includes("opengw")) return new Response(JSON.stringify({ result: { models: [{ model_id: "deepseek-v4.1-flash" }] } }), { status: 200 })
+    if (u === x.CHAT_API_BASE + "/chat/completions") {
+      return new Headers(init.headers).get("maas_type") && ak !== "AK"
+        ? sseResponse(sse({ error_code: "InferHub.4004.200", error_msg: "benefit not found" }))
+        : sseResponse(okStream)
+    }
+    return new Response(JSON.stringify({ builtinModels: ak === "AK" ? [] : [{ model_id: "deepseek-v4.1-flash" }] }), { status: 200 })
   }
+  const sent = []
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url, init) => {
+      const ak = /Access=([^,]+),/.exec(new Headers(init.headers).get("authorization") ?? "")?.[1]
+      if (String(url) === CHAT_URL) sent.push([ak, new Headers(init.headers).get("maas_type")])
+      return listFor(ak)(url, init)
+    },
+  })
+  const a = await plugin.provider.models({ models: {} }, { auth: makeAuth(credA) })
+  const b = await plugin.provider.models({ models: {} }, { auth: makeAuth(credB) })
+  assert.equal(a["deepseek-v4.1-flash"].free, true)
+  assert.equal(b["deepseek-v4.1-flash"].free, false)
+  const loadedA = await plugin.auth.loader(async () => makeAuth(credA))
+  const loadedB = await plugin.auth.loader(async () => makeAuth(credB))
+  await (await loadedB.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }))).text()
+  await (await loadedA.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }))).text()
+  // B bills it as its builtin model; A still sends it as its free one.
+  assert.deepEqual(sent, [["AKB", null], ["AK", "benefit"]])
 })
 
 test("benefit not found sends the request again as the plain builtin model, and remembers it", async () => {
-  const before = [...x.BENEFIT_MODEL_FALLBACK]
-  try {
-    // The free list and the builtin list both name the model.
-    await x.fetchRemoteModels({ access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, async (url) => String(url).includes("opengw")
-      ? new Response(JSON.stringify({ result: { models: [{ model_id: "deepseek-v4.1-flash" }] } }), { status: 200 })
-      : new Response(JSON.stringify({ builtinModels: [{ model_id: "deepseek-v4.1-flash" }] }), { status: 200 }))
-    const cred = await makeCred()
-    const sent = []
-    const plugin = await CodeArtsAuthPlugin({ client: {} }, {
-      fetch: async (url, init) => {
-        const benefit = new Headers(init.headers).get("maas_type")
-        sent.push(benefit)
-        return benefit
-          ? sseResponse(sse({ error_code: "InferHub.4004.200", error_msg: "benefit not found" }))
-          : sseResponse(okStream)
-      },
-    })
-    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
-    const a = await loaded.fetch(CHAT_URL, chatInit({ model: "codearts/deepseek-v4.1-flash", messages: [] }))
-    assert.equal(a.status, 200)
-    assert.equal((await a.json()).choices[0].message.content, "你好")
-    const b = await loaded.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }))
-    await b.text()
-    assert.deepEqual(sent, ["benefit", null, null])
-  } finally {
-    x.rememberBenefitIds(before)
-  }
+  const cred = await makeCred()
+  const sent = []
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url, init) => {
+      const u = String(url)
+      // The free list and the builtin list both name the model, and today's
+      // benefit is claimed.
+      if (u === x.BENEFIT_CLAIM_URL) return new Response('{"error_code":"0000"}', { status: 200 })
+      if (u.includes("opengw")) return new Response(JSON.stringify({ result: { models: [{ model_id: "deepseek-v4.1-flash" }] } }), { status: 200 })
+      if (u !== CHAT_URL) return new Response(JSON.stringify({ builtinModels: [{ model_id: "deepseek-v4.1-flash" }] }), { status: 200 })
+      const benefit = new Headers(init.headers).get("maas_type")
+      sent.push(benefit)
+      return benefit
+        ? sseResponse(sse({ error_code: "InferHub.4004.200", error_msg: "benefit not found" }))
+        : sseResponse(okStream)
+    },
+  })
+  await plugin.provider.models({ models: {} }, { auth: makeAuth(cred) })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const a = await loaded.fetch(CHAT_URL, chatInit({ model: "codearts/deepseek-v4.1-flash", messages: [] }))
+  assert.equal(a.status, 200)
+  assert.equal((await a.json()).choices[0].message.content, "你好")
+  const b = await loaded.fetch(CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }))
+  await b.text()
+  assert.deepEqual(sent, ["benefit", null, null])
 })
 
 test("a 429 that queues the request is waited out the agent's way, then sent again", async () => {
@@ -851,26 +948,70 @@ test("a 429 that queues the request is waited out the agent's way, then sent aga
 test("giving up in the queue takes the request out of it", async () => {
   const cred = await makeCred()
   const calls = []
+  // The DELETE is sent in the background (it signs first): wait for the DELETE
+  // itself, never for a fixed time.
+  let deleted
+  let sawDelete = new Promise((r) => { deleted = r })
+  // The caller gives up once the request is queued, never before it is sent.
+  const ctl = new AbortController()
   const fetcher = async (url, init) => {
     calls.push([init.method, String(url)])
+    if (init.method === "DELETE") deleted()
     if (String(url) === x.TRACE_QUEUE_URL("T2")) return new Response(JSON.stringify({ status: "queued", retry_after: 30 }), { status: 200 })
+    setTimeout(() => ctl.abort(), 0)
     return new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "T2", "retry-after": "30" } })
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
-  const ctl = new AbortController()
-  setTimeout(() => ctl.abort(), 20)
   await assert.rejects(loaded.fetch(CHAT_URL, { ...chatInit({ model: "GLM-5.2", messages: [] }), signal: ctl.signal }), { name: "AbortError" })
-  await new Promise((r) => setTimeout(r, 10))
+  await sawDelete
   assert.deepEqual(calls.at(-1), ["DELETE", x.TRACE_QUEUE_URL("T2")])
 
   // A queue the wait budget can't cover is left at once, and answered 429.
   calls.length = 0
+  sawDelete = new Promise((r) => { deleted = r })
   const quick = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueBudgetMs: 1_000 })
   const res = await (await quick.auth.loader(async () => makeAuth(cred))).fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
   assert.equal(res.status, 429)
-  await new Promise((r) => setTimeout(r, 10))
+  await sawDelete
   assert.deepEqual(calls.map((c) => c[0]), ["POST", "DELETE"])
+})
+
+test("a queue poll that hangs can't outlast the wait: the request leaves the queue, a 429", async () => {
+  const cred = await makeCred()
+  const calls = []
+  let deleted
+  const sawDelete = new Promise((r) => { deleted = r })
+  const fetcher = async (url, init) => {
+    calls.push(init.method)
+    if (init.method === "DELETE") {
+      deleted()
+      return new Response("{}", { status: 200 })
+    }
+    if (String(url) === x.TRACE_QUEUE_URL("T3")) {
+      // The poll never answers: only its signal ends it (without one, never),
+      // at once when it ended while the request was signed, as fetch does.
+      // Its open socket is what keeps a real process alive meanwhile: an
+      // AbortSignal.timeout alone doesn't, in node or bun.
+      return new Promise((_, reject) => {
+        if (init.signal?.aborted) return reject(init.signal.reason)
+        const socket = setInterval(() => {}, 1_000)
+        init.signal?.addEventListener("abort", () => {
+          clearInterval(socket)
+          reject(init.signal.reason)
+        })
+      })
+    }
+    return new Response("{}", { status: 429, headers: { "queue-status": "queued", "trace-id": "T3", "retry-after": "0" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueBudgetMs: 200 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(res.status, 429)
+  await sawDelete
+  assert.equal(calls[0], "POST")
+  assert.equal(calls.at(-1), "DELETE")
+  assert.ok(calls.slice(1, -1).length >= 1 && calls.slice(1, -1).every((m) => m === "GET"))
 })
 
 test("a 429 that is no queue passes through for magpie to fail over", async () => {
@@ -987,6 +1128,160 @@ test("a spent refresh token marks the sign-in and stops calling the vendor", asy
   assert.equal(chats, 1)
 })
 
+test("a 403 is a sign-in the account no longer has, on chats and other requests alike", async () => {
+  const cred = await makeCred()
+  const denied = '{"error_code":"APIG.0305","error_msg":"access denied"}'
+  let calls = 0
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async () => {
+      calls += 1
+      return new Response(denied, { status: 403 })
+    },
+  })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const chat = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(chat.status, 403)
+  assert.equal(chat.headers.get("x-magpie-sign-in"), "expired")
+  assert.equal(await chat.text(), denied)
+  const other = await loaded.fetch("https://snap-access.cn-north-4.myhuaweicloud.com/api/v1/models", { method: "GET" })
+  assert.equal(other.status, 403)
+  assert.equal(other.headers.get("x-magpie-sign-in"), "expired")
+  assert.equal(await other.text(), denied)
+  assert.equal(calls, 2, "a 403 is not retried")
+})
+
+test("isSignedHostUrl takes only https URLs on the two hosts the plugin calls, by name", () => {
+  assert.deepEqual([...x.SIGNED_HOSTS].sort(), ["opengw.developer.huaweicloud.com", "snap-access.cn-north-4.myhuaweicloud.com"])
+  assert.equal(x.isSignedHostUrl(CHAT_URL), true)
+  assert.equal(x.isSignedHostUrl(x.BENEFIT_CLAIM_URL), true)
+  assert.equal(x.isSignedHostUrl("https://SNAP-ACCESS.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"), true, "a hostname has no case")
+  // Other Huawei Cloud hosts don't get the account's signature either.
+  for (const other of ["https://codearts.huaweicloud.com/x", "https://iam.myhuaweicloud.cn/v3", "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens", "https://snap-access.cn-south-1.myhuaweicloud.com/api"]) {
+    assert.equal(x.isSignedHostUrl(other), false, other)
+  }
+  assert.equal(x.isSignedHostUrl("http://snap-access.cn-north-4.myhuaweicloud.com/api"), false, "not over plain http")
+  assert.equal(x.isSignedHostUrl("https://snap-access.cn-north-4.myhuaweicloud.com:8443/api"), false, "not on another port")
+  assert.equal(x.isSignedHostUrl("https://snap-access.cn-north-4.myhuaweicloud.com.example.com/"), false)
+  assert.equal(x.isSignedHostUrl("https://example.com/?u=snap-access.cn-north-4.myhuaweicloud.com"), false)
+  assert.equal(x.isSignedHostUrl("not a url"), false)
+})
+
+test("a request to any other host is refused before the credentials leave", async () => {
+  const cred = await makeCred()
+  let calls = 0
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => { calls += 1; return sseResponse(okStream) } })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  for (const url of ["https://api.example.com/v1/chat/completions", "http://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"]) {
+    const res = await loaded.fetch(url, chatInit({ model: "GLM-5.2", messages: [] }))
+    assert.equal(res.status, 400)
+    assert.match((await res.json()).error.message, /refusing to sign a request to/)
+  }
+  assert.equal(calls, 0)
+})
+
+const staleBody = '{"error_code":"APIG.0602","error_msg":"the security token has expired"}'
+const spentBody = JSON.stringify({ error_code: "STS5.1806", error_msg: "refresh token has been used" })
+
+test("a renewal that fails only for now keeps the sign-in, and the next request renews again", async () => {
+  const cred = await makeCred()
+  let sts = 0
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      sts += 1
+      return sts === 1 ? new Response("upstream unavailable", { status: 503 }) : new Response(stsBody("AK2", "R2"), { status: 200 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const a = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))
+  assert.equal(a.status, 503)
+  assert.equal(a.headers.get("x-magpie-sign-in"), "kept")
+  const b = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(b.status, 200)
+  await b.text()
+  assert.equal(sts, 2)
+
+  // A request that isn't a chat: the same.
+  const other = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url) => (String(url) === x.STS_TOKEN_ENDPOINT ? new Response("", { status: 503 }) : new Response(staleBody, { status: 401 })),
+  })
+  const res = await (await other.auth.loader(async () => makeAuth(cred))).fetch("https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin", { method: "GET" })
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get("x-magpie-sign-in"), "kept")
+})
+
+test("two loaders of one account and magpie's own renewal spend its refresh token once", async () => {
+  const cred = await makeCred()
+  let sts = 0
+  let release
+  const held = new Promise((r) => { release = r })
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      sts += 1
+      await held
+      // STS takes a refresh token once.
+      return sts === 1 ? new Response(stsBody("AK2", "R2"), { status: 200 }) : new Response(spentBody, { status: 400 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  // Nothing is stored meanwhile: every read gives the old record.
+  const getAuth = async () => makeAuth(cred)
+  const loaders = await Promise.all([plugin.auth.loader(getAuth), plugin.auth.loader(getAuth)])
+  const answers = Promise.all(loaders.map((l) => l.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [] }))))
+  const refreshed = plugin.auth.refresh(makeAuth(cred))
+  while (sts < 1) await new Promise((r) => setTimeout(r, 5))
+  await new Promise((r) => setTimeout(r, 20))
+  release()
+  for (const res of await answers) {
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get("x-magpie-sign-in"), null)
+  }
+  assert.equal(JSON.parse((await refreshed).access).access_key_id, "AK2")
+  // One that comes later with the spent token gets what the renewal gave.
+  assert.equal(JSON.parse((await plugin.auth.refresh(makeAuth(cred))).access).access_key_id, "AK2")
+  assert.equal(sts, 1)
+})
+
+test("a refresh token spent a moment ago by someone else: their renewal is taken, the sign-in kept", async () => {
+  const cred = await makeCred()
+  const theirs = { ...cred, access_key_id: "AK3", secret_access_key: "SK3", security_token: "ST3", refresh_token: "R3" }
+  let stored = cred
+  const fetcher = async (url, init) => {
+    if (String(url) === x.STS_TOKEN_ENDPOINT) {
+      stored = theirs // another process won the race and saved its renewal
+      return new Response(spentBody, { status: 400 })
+    }
+    return /Access=AK,/.test(new Headers(init.headers).get("authorization")) ? new Response(staleBody, { status: 401 }) : sseResponse(okStream)
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(stored))
+  const res = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), okStream)
+  const next = await loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
+  assert.equal(next.status, 200, "the account isn't marked")
+  await next.text()
+})
+
+test("a reshaped body goes without the caller's Content-Length", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: async (url, init) => {
+      seen.push({ length: new Headers(init.headers).get("content-length"), bytes: init.body.length })
+      return sseResponse(okStream)
+    },
+  })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const body = JSON.stringify({ model: "codearts/GLM-5.2", messages: [] })
+  const headers = { "content-type": "application/json", "content-length": String(body.length) }
+  await (await loaded.fetch(CHAT_URL, { method: "POST", headers, body })).text()
+  assert.equal(seen[0].length, null)
+  assert.notEqual(seen[0].bytes, body.length, "the body was reshaped")
+})
+
 test("requestToken reads a spent refresh token as a sign-in gone for good", async () => {
   const keyPair = await x.generateDpopKeyPair()
   const fetcher = async () => new Response(JSON.stringify({ error_code: "STS5.1806", error_msg: "refresh token has been used" }), { status: 400 })
@@ -997,27 +1292,69 @@ test("requestToken reads a spent refresh token as a sign-in gone for good", asyn
 
 test("in-flight chats per account are capped, and a permit comes back when the body ends", async () => {
   const cred = await makeCred()
-  const controllers = []
-  const fetcher = async () => {
+  // Each upstream stream is kept under the request that opened it (its body
+  // names it): requests reach the fetcher in no set order, as each one signs
+  // with WebCrypto first, so `first[i]` is paired with stream `i` by name.
+  const streams = new Map()
+  const fetcher = async (url, init) => {
+    const n = JSON.parse(new TextDecoder().decode(init.body)).messages[0].content
     let ctl
     const body = new ReadableStream({ start(c) { ctl = c } })
     ctl.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: "x" } }] })))
-    controllers.push(ctl)
+    streams.set(n, ctl)
     return sseResponse(body)
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
-  const send = () => loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true }))
-  const first = await Promise.all([send(), send(), send()])
-  const fourth = send()
-  await new Promise((r) => setTimeout(r, 20))
-  assert.equal(controllers.length, 3, "the 4th waits for a permit")
-  controllers[0].close()
+  const send = (n) => loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [{ role: "user", content: n }], stream: true }))
+  const first = await Promise.all(["0", "1", "2"].map(send))
+  const fourth = send("3")
+  // Three streams are open, so the fourth holds; give it a chance to get past
+  // the gate, which it must not.
+  await new Promise((r) => setTimeout(r, 30))
+  assert.deepEqual([...streams.keys()].sort(), ["0", "1", "2"], "the 4th waits for a permit")
+  streams.get("0").close()
   await first[0].text()
   const res = await fourth
-  assert.equal(controllers.length, 4)
-  for (const c of controllers.slice(1)) c.close()
+  assert.ok(streams.has("3"))
+  for (const n of ["1", "2", "3"]) streams.get(n).close()
   await Promise.all([...first.slice(1), res].map((r) => r.text()))
+})
+
+test("maxInflight can lower the gate but never lift it past the vendor's 3 sessions", async () => {
+  const cred = await makeCred()
+  const open = (opts, cap) => async () => {
+    const streams = []
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+      ...opts,
+      fetch: async () => {
+        let ctl
+        const body = new ReadableStream({ start(c) { ctl = c } })
+        ctl.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: "x" } }] })))
+        streams.push(ctl)
+        return sseResponse(body)
+      },
+    })
+    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+    // Each answer is read as it comes; a permit comes back when its body ends.
+    const read = Array.from({ length: 5 }, () =>
+      loaded.fetch(CHAT_URL, chatInit({ model: "GLM-5.2", messages: [], stream: true })).then((r) => r.text()))
+    // Wait for the cap to fill, however slow the signing, then give one more
+    // request the chance to slip past it.
+    while (streams.length < cap) await new Promise((r) => setTimeout(r, 5))
+    await new Promise((r) => setTimeout(r, 30))
+    const inFlight = streams.length
+    let finished = false
+    const all = Promise.all(read).then(() => { finished = true })
+    while (!finished) {
+      for (const c of streams.splice(0)) c.close()
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    await all
+    return { inFlight, maxConcurrency: plugin.auth.maxConcurrency }
+  }
+  assert.deepEqual(await open({ maxInflight: 10 }, 3)(), { inFlight: 3, maxConcurrency: 3 })
+  assert.deepEqual(await open({ maxInflight: 1 }, 1)(), { inFlight: 1, maxConcurrency: 1 })
 })
 
 test("loader adds a signed maas_type header for benefit models", async () => {
@@ -1064,6 +1401,49 @@ test("auth.refresh exchanges the refresh token for fresh credentials", async () 
   assert.equal(next.expires, Date.parse("2031-01-01T00:00:00Z"))
 })
 
+/** Check a token request's DPoP proof: it verifies against the stored key, for POST to the STS endpoint. */
+async function assertDpopFor(proof, publicKeyJwk) {
+  const [h, p, s] = proof.split(".")
+  const header = JSON.parse(Buffer.from(h, "base64url").toString())
+  const payload = JSON.parse(Buffer.from(p, "base64url").toString())
+  assert.equal(header.typ, "dpop+jwt")
+  assert.deepEqual(header.jwk, publicKeyJwk, "signed with the credential's own DPoP key")
+  assert.equal(payload.htm, "POST")
+  assert.equal(payload.htu, x.STS_TOKEN_ENDPOINT)
+  const key = await crypto.subtle.importKey("jwk", header.jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"])
+  assert.ok(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, Buffer.from(s, "base64url"), buf(`${h}.${p}`)))
+}
+
+test("token requests carry a DPoP proof for POST to the STS endpoint, signed with the credential's key", async () => {
+  const cred = await makeCred()
+  const { publicKeyJwk } = x.keyPairFromStoredJwk(cred.dpop_private_key_jwk)
+  const proofs = []
+  const bodies = []
+  const fetcher = async (url, init) => {
+    proofs.push(new Headers(init.headers).get("dpop"))
+    bodies.push(new URLSearchParams(init.body))
+    return new Response(JSON.stringify({
+      credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: "2031-01-01T00:00:00Z" },
+      refresh_token: "R2",
+    }), { status: 200 })
+  }
+  // A refresh, and an authorization-code exchange.
+  await x.refreshCredential(cred, fetcher)
+  await x.exchangeAuthorizationCode("CODE", "verifier", 12345, x.keyPairFromStoredJwk(cred.dpop_private_key_jwk), fetcher)
+  for (const proof of proofs) await assertDpopFor(proof, publicKeyJwk)
+  assert.equal(bodies[0].get("grant_type"), "refresh_token")
+  assert.equal(bodies[0].get("refresh_token"), "R")
+  assert.equal(bodies[0].get("code_verifier"), "verifier")
+  assert.equal(bodies[1].get("grant_type"), "authorization_code")
+  assert.equal(bodies[1].get("code"), "CODE")
+  assert.equal(bodies[1].get("redirect_uri"), "http://127.0.0.1:12345/oauth/callback")
+})
+
+test("a credential with nothing to renew it with is a sign-in gone for good", async () => {
+  const cred = { ...(await makeCred()), refresh_token: undefined }
+  await assert.rejects(x.refreshCredential(cred, async () => { throw new Error("no network expected") }), (e) => e.signIn === "expired")
+})
+
 test("provider.models returns the account's live list", async () => {
   const cred = await makeCred()
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: modelsFetcher([]) })
@@ -1088,38 +1468,33 @@ const agentDetail = {
 }
 
 test("provider.models: free models once claimed, rates and parameters from the CodeAgent", async () => {
-  const before = [...x.BENEFIT_MODEL_FALLBACK]
-  try {
-    const cred = await makeCred()
-    const seen = []
-    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: modelsFetcher(seen, { agents: agentList, detail: agentDetail }) })
-    const provider = { models: {} }
-    const models = await plugin.provider.models(provider, { auth: makeAuth(cred) })
-    assert.deepEqual(Object.keys(models).sort(), ["GLM-5.2", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.3-flash"])
-    // Today's benefit claimed: the gateway's models are free and carry no rate.
-    assert.equal(models["glm-5.3-flash"].free, true)
-    assert.equal(models["glm-5.3-flash"].rate, undefined)
-    // The rest bill credits at the agent's own rate.
-    assert.equal(models["GLM-5.2"].free, false)
-    assert.equal(models["GLM-5.2"].rate, 1.5)
-    assert.equal(models["GLM-5.2"].capabilities.reasoning, true)
-    assert.equal(models["GLM-5.2"].limit.output, x.MAX_OUTPUT_TOKENS)
-    // Only the agent lists it: one more model; a user's own is left out.
-    assert.equal(models["glm-5.3"].rate, 0.8)
-    assert.equal(models["glm-5.3"].limit.context, 1048576)
-    assert.equal(models["my-own"], undefined)
-    // The claim went out signed, and the detail named the CodeAgent's own id.
-    const claim = seen.find((s) => s.url === x.BENEFIT_CLAIM_URL)
-    assert.equal(claim.method, "POST")
-    assert.match(claim.auth, /^SDK-HMAC-SHA256 /)
-    assert.ok(seen.some((s) => s.url === x.AGENT_DETAIL_URL("a-code-1")))
-    // Listed again the same day: no second claim, no second agent list.
-    await plugin.provider.models(provider, { auth: makeAuth(cred) })
-    assert.equal(seen.filter((s) => s.url === x.BENEFIT_CLAIM_URL).length, 1)
-    assert.equal(seen.filter((s) => s.url === x.AGENT_LIST_URL).length, 1)
-  } finally {
-    x.rememberBenefitIds(before)
-  }
+  const cred = await makeCred()
+  const seen = []
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: modelsFetcher(seen, { agents: agentList, detail: agentDetail }) })
+  const provider = { models: {} }
+  const models = await plugin.provider.models(provider, { auth: makeAuth(cred) })
+  assert.deepEqual(Object.keys(models).sort(), ["GLM-5.2", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.3-flash"])
+  // Today's benefit claimed: the gateway's models are free and carry no rate.
+  assert.equal(models["glm-5.3-flash"].free, true)
+  assert.equal(models["glm-5.3-flash"].rate, undefined)
+  // The rest bill credits at the agent's own rate.
+  assert.equal(models["GLM-5.2"].free, false)
+  assert.equal(models["GLM-5.2"].rate, 1.5)
+  assert.equal(models["GLM-5.2"].capabilities.reasoning, true)
+  assert.equal(models["GLM-5.2"].limit.output, x.MAX_OUTPUT_TOKENS)
+  // Only the agent lists it: one more model; a user's own is left out.
+  assert.equal(models["glm-5.3"].rate, 0.8)
+  assert.equal(models["glm-5.3"].limit.context, 1048576)
+  assert.equal(models["my-own"], undefined)
+  // The claim went out signed, and the detail named the CodeAgent's own id.
+  const claim = seen.find((s) => s.url === x.BENEFIT_CLAIM_URL)
+  assert.equal(claim.method, "POST")
+  assert.match(claim.auth, /^SDK-HMAC-SHA256 /)
+  assert.ok(seen.some((s) => s.url === x.AGENT_DETAIL_URL("a-code-1")))
+  // Listed again the same day: no second claim, no second agent list.
+  await plugin.provider.models(provider, { auth: makeAuth(cred) })
+  assert.equal(seen.filter((s) => s.url === x.BENEFIT_CLAIM_URL).length, 1)
+  assert.equal(seen.filter((s) => s.url === x.AGENT_LIST_URL).length, 1)
 })
 
 test("the model list comes from the main agent: original_id build, then CodeAgent, then the IDE's id", async () => {
@@ -1158,29 +1533,62 @@ test("the model list comes from the main agent: original_id build, then CodeAgen
 })
 
 test("a benefit the account can't claim: no free models, and no benefit header", async () => {
-  const before = [...x.BENEFIT_MODEL_FALLBACK]
-  try {
-    const cred = await makeCred()
-    const seen = []
-    const list = modelsFetcher(seen, { claim: "4004" })
-    const sent = []
-    const fetcher = async (url, init) => {
-      if (String(url) === CHAT_URL) {
-        sent.push(new Headers(init.headers).get("maas_type"))
-        return sseResponse(okStream)
-      }
-      return list(url, init)
+  const cred = await makeCred()
+  const seen = []
+  const list = modelsFetcher(seen, { claim: "4004" })
+  const sent = []
+  const fetcher = async (url, init) => {
+    if (String(url) === CHAT_URL) {
+      sent.push(new Headers(init.headers).get("maas_type"))
+      return sseResponse(okStream)
     }
-    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
-    const models = await plugin.provider.models({ models: {} }, { auth: makeAuth(cred) })
-    // The gateway's free-only models can't be called without the benefit.
-    assert.deepEqual(Object.keys(models), ["GLM-5.2"])
-    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
-    await (await loaded.fetch(CHAT_URL, chatInit({ model: "glm-5.3-flash", messages: [] }))).text()
-    assert.deepEqual(sent, [null])
-  } finally {
-    x.rememberBenefitIds(before)
+    return list(url, init)
   }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const models = await plugin.provider.models({ models: {} }, { auth: makeAuth(cred) })
+  // The gateway's free-only models can't be called without the benefit.
+  assert.deepEqual(Object.keys(models), ["GLM-5.2"])
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await (await loaded.fetch(CHAT_URL, chatInit({ model: "glm-5.3-flash", messages: [] }))).text()
+  assert.deepEqual(sent, [null])
+})
+
+test("benefit not found on a day not yet claimed claims it, and sends the free model again", async () => {
+  const state = {
+    benefit: new Set(["deepseek-v4.1-flash"]), regular: new Set(["deepseek-v4.1-flash"]), noBenefit: new Set(),
+    claim: { day: "2000-01-01", ok: true, at: 0 }, claiming: null,
+  }
+  const sent = []
+  let claims = 0
+  const fetcher = async (url, init) => {
+    if (String(url) === x.BENEFIT_CLAIM_URL) {
+      claims += 1
+      return new Response('{"error_code":"0000"}', { status: 200 })
+    }
+    const benefit = new Headers(init.headers).get("maas_type")
+    sent.push(benefit)
+    // Yesterday's benefit is spent: only today's claim brings it back.
+    return benefit && !claims ? sseResponse(sse({ error_code: "InferHub.4004.200", error_msg: "benefit not found" })) : sseResponse(okStream)
+  }
+  const context = { ...(await x.accountSessionIds(signedCred)), gate: x.createConcurrencyGate(3), state, fetcher }
+  const res = await x.signedFetch(signedCred, CHAT_URL, chatInit({ model: "deepseek-v4.1-flash", messages: [] }), context)
+  assert.equal(res.status, 200)
+  assert.equal((await res.json()).choices[0].message.content, "你好")
+  assert.deepEqual(sent, ["benefit", "benefit"])
+  assert.equal(claims, 1)
+  assert.equal(state.claim.day, x.beijingDay())
+  assert.equal(state.noBenefit.size, 0)
+})
+
+test("a day's claim asks again about the models the last day had no benefit for", async () => {
+  const state = { noBenefit: new Set(["deepseek-v4.1-flash"]), claim: { day: "2000-01-01", ok: true, at: 0 } }
+  const claimed = async () => new Response('{"error_code":"0000"}', { status: 200 })
+  assert.equal(await x.ensureBenefitClaimed(signedCred, claimed, state), true)
+  assert.equal(state.noBenefit.size, 0)
+  // A refused claim leaves them as they were.
+  const refused = { noBenefit: new Set(["deepseek-v4.1-flash"]), claim: null }
+  assert.equal(await x.ensureBenefitClaimed(signedCred, async () => new Response('{"error_code":"4004"}', { status: 200 }), refused), false)
+  assert.equal(refused.noBenefit.size, 1)
 })
 
 test("ensureBenefitClaimed claims once a day and asks again only an hour after a refusal", async () => {
@@ -1343,9 +1751,43 @@ test("checkin skips the confirm when the claim answers no id", async () => {
   assert.equal(calls.some((c) => c.url === x.OPS_CONFIRM_URL), false)
 })
 
+test("checkin confirms a claim left unconfirmed, and tries again later when the confirm fails", async () => {
+  const cred = await makeCred()
+  // The first try: the claim goes through, the confirm doesn't.
+  const s = { item: daily() }
+  const first = await x.dailyCheckin(cred, opsFetcher(s, { confirm: () => new Response("", { status: 502 }) }).fetcher)
+  assert.deepEqual(first, { outcome: "failed", message: "领取确认失败：HTTP 502" })
+  assert.equal(s.item.status, "CLAIMED")
+  // Later that day: it is confirmed now, not taken as done.
+  const { fetcher, calls } = opsFetcher(s)
+  const { grant, ...again } = await x.dailyCheckin(cred, fetcher)
+  assert.deepEqual(again, { outcome: "claimed", credit: 1000, message: "+1000 积分" })
+  assert.equal(grant.credit, 1000)
+  assert.deepEqual(calls.map((c) => [c.method, c.url]), [["GET", x.OPS_DELIVERY_URL], ["POST", x.OPS_CONFIRM_URL]])
+  assert.deepEqual(calls[1].body, { campaignId: 1 })
+  assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
+  // A confirm the vendor turns down while the activity is still only claimed
+  // (活动太火爆, a code in a 200, as much as a 503): a failure, tried again later.
+  const busy = () => new Response(JSON.stringify({ code: 500, message: "活动太火爆" }), { status: 200 })
+  for (const confirm of [busy, () => new Response("", { status: 503 })]) {
+    const still = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm })
+    const r = await x.dailyCheckin(cred, still.fetcher)
+    assert.equal(r.outcome, "failed")
+    assert.match(r.message, /^领取确认失败：/)
+    assert.deepEqual(still.calls.map((c) => c.method), ["GET", "POST", "GET"], "the activity is looked at again")
+  }
+  // Turned down because it was confirmed meanwhile (the IDE): done.
+  const elsewhere = (st) => {
+    st.item = { ...st.item, status: "CONFIRMED" }
+    return new Response(JSON.stringify({ code: 1002, message: "already confirmed" }), { status: 200 })
+  }
+  const meanwhile = opsFetcher({ item: daily({ claimable: false, status: "CLAIMED" }) }, { confirm: elsewhere })
+  assert.equal((await x.dailyCheckin(cred, meanwhile.fetcher)).outcome, "done")
+})
+
 test("checkin tells done, inactive and ineligible apart", async () => {
   const cred = await makeCred()
-  for (const status of ["CLAIMED", "CONFIRMED", "CONSUMED"]) {
+  for (const status of ["CONFIRMED", "CONSUMED"]) {
     const { fetcher, calls } = opsFetcher({ item: daily({ claimable: false, status }) })
     assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
     assert.equal(calls.length, 1)
@@ -1386,9 +1828,148 @@ test("startOAuthFlow serves a callback server and a valid login URL", async () =
   const port = Number(url.searchParams.get("port"))
   assert.ok(port >= 10000, "callback port must be >= 10000")
 
-  // A callback without code/secret is rejected.
-  const res = await fetch(`http://127.0.0.1:${port}/oauth/callback`)
-  assert.equal(res.status, 400)
+  // A callback without a code fails the flow at once (the browser is sent to
+  // the portal's failure page, not followed there).
+  const res = await fetch(`http://127.0.0.1:${port}/oauth/callback`, { redirect: "manual" })
+  assert.equal(res.status, 307)
+  await assert.rejects(flow.result, /without an authorization code/)
 
   await flow.close()
+})
+
+test("the callback port is one >= 10000, another while the one picked is taken", async () => {
+  const { EventEmitter } = await import("node:events")
+  // A stand-in server: the system gives a port below 10000, and the first
+  // random picks are someone else's.
+  const fakeServer = (taken, code = "EADDRINUSE") => {
+    const tried = []
+    const server = Object.assign(new EventEmitter(), {
+      listen(port, host, cb) {
+        tried.push(port)
+        this.port = port === 0 ? 8080 : port
+        if (port !== 0 && tried.length - 1 <= taken) {
+          queueMicrotask(() => this.emit("error", Object.assign(new Error("listen failed"), { code })))
+          return
+        }
+        queueMicrotask(cb)
+      },
+      address() { return { port: this.port } },
+      close(cb) { queueMicrotask(cb) },
+    })
+    return { server, tried }
+  }
+  const busy = fakeServer(3)
+  const port = await x.listenOnCallbackPort(busy.server)
+  assert.equal(busy.tried[0], 0)
+  assert.equal(busy.tried.length, 5)
+  assert.ok(port >= 10000)
+  assert.equal(port, busy.tried.at(-1))
+  // Anything but a taken port is no reason to try another.
+  const denied = fakeServer(1, "EACCES")
+  await assert.rejects(x.listenOnCallbackPort(denied.server), { code: "EACCES" })
+  assert.equal(denied.tried.length, 2)
+})
+
+/** Run a callback server for one test, its STS answered by `sts`. */
+async function withCallbackServer(sts, run) {
+  const pkce = await x.generatePkcePair()
+  const keyPair = await x.generateDpopKeyPair()
+  const exchanges = []
+  const fetcher = async (url, init) => {
+    exchanges.push(new URLSearchParams(init.body))
+    return sts()
+  }
+  const { port, server, result } = await x.startOAuthCallbackServer(pkce, keyPair, fetcher)
+  result.catch(() => {})
+  const call = (query = "", init = {}) =>
+    fetch(`http://127.0.0.1:${port}${x.REDIRECT_PATH}${query}`, { redirect: "manual", ...init })
+  try {
+    await run({ port, call, result, exchanges, pkce })
+  } finally {
+    server.closeAllConnections?.()
+    await new Promise((resolve) => server.close(() => resolve()))
+  }
+}
+
+/**
+ * A GET with its path sent as written, over a bare socket: fetch, and bun's
+ * http.request, normalise `/oauth/./callback` before it leaves. Gives the
+ * status and the Location.
+ */
+const rawGet = (port, rawPath) => new Promise((resolve, reject) => {
+  const socket = net.connect(port, "127.0.0.1", () => {
+    socket.write(`GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+  })
+  let answer = ""
+  socket.on("data", (d) => { answer += d })
+  socket.on("end", () => resolve({
+    status: Number(/^HTTP\/1\.1 (\d{3})/.exec(answer)?.[1]),
+    location: /^location: *(.*?)\r?$/im.exec(answer.split("\r\n\r\n")[0])?.[1] ?? null,
+  }))
+  socket.on("error", reject)
+})
+
+test("the callback server takes only a GET to the exact path with a code, and never a redirect it is handed", async () => {
+  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ port, call, result, exchanges }) => {
+    const post = await call("?code=C", { method: "POST" })
+    assert.equal(post.status, 405)
+    assert.equal(post.headers.get("allow"), "GET")
+    // Only the path exactly as sent: none of these is it.
+    const near = ["/other", "/oauth/./callback", "/oauth/%2e/callback", "/oauth/callback/", "/OAUTH/callback", "//oauth/callback"]
+    for (const path of near.map((p) => `${p}?code=C`)) {
+      assert.equal((await rawGet(port, path)).status, 404, path)
+    }
+    assert.equal(exchanges.length, 0)
+    // The old login's parameters are no way in: no code is a sign-in that
+    // failed, at once, and the browser goes to the portal's page, not theirs.
+    // (Sent the raw way too, so the 404s above aren't the socket's doing.)
+    const legacyRaw = await rawGet(port, `${x.REDIRECT_PATH}?secret=S&redirect=https%3A%2F%2Fevil.example%2F`)
+    assert.deepEqual(legacyRaw, { status: 307, location: x.buildPortalLoginResultUrl(false) })
+    await assert.rejects(result, /without an authorization code/)
+    // Nothing after that is taken, nor exchanged.
+    const legacy = await call(`?secret=${encodeURIComponent('{"access":"AK"}')}&redirect=${encodeURIComponent("https://evil.example/")}`)
+    assert.equal(legacy.status, 409)
+    assert.equal(legacy.headers.get("location"), null)
+    assert.equal((await call("?code=C")).status, 409)
+    assert.equal(exchanges.length, 0)
+  })
+})
+
+test("a callback the portal sends back with an error ends the sign-in at once, in its words", async () => {
+  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ call, result }) => {
+    const started = Date.now()
+    const res = await call("?error=access_denied&error_description=user%20cancelled%20the%20sign-in")
+    assert.equal(res.status, 307)
+    assert.equal(res.headers.get("location"), x.buildPortalLoginResultUrl(false))
+    await assert.rejects(result, /CodeArts sign-in failed: user cancelled the sign-in/)
+    assert.ok(Date.now() - started < 5_000, "not left to the 180 s timeout")
+  })
+})
+
+test("the callback server exchanges the code once, then sends the browser to the portal's result page", async () => {
+  await withCallbackServer(() => new Response(stsBody("AK", "R"), { status: 200 }), async ({ port, call, result, exchanges, pkce }) => {
+    const res = await call(`?code=C1&redirect=${encodeURIComponent("https://evil.example/")}`)
+    assert.equal(res.status, 307)
+    assert.equal(res.headers.get("location"), x.buildPortalLoginResultUrl(true))
+    const signedIn = await result
+    const cred = JSON.parse(signedIn.access)
+    assert.equal(cred.access_key_id, "AK")
+    assert.equal(cred.code_verifier, pkce.codeVerifier)
+    assert.equal(exchanges.length, 1)
+    assert.equal(exchanges[0].get("code"), "C1")
+    assert.equal(exchanges[0].get("redirect_uri"), `http://127.0.0.1:${port}${x.REDIRECT_PATH}`)
+    // A second callback for the same sign-in is refused, and not exchanged.
+    const again = await call("?code=C2")
+    assert.equal(again.status, 409)
+    assert.equal(exchanges.length, 1)
+  })
+})
+
+test("a code STS turns down sends the browser to the portal's failure page", async () => {
+  await withCallbackServer(() => new Response('{"error":"invalid_grant"}', { status: 400 }), async ({ call, result }) => {
+    const res = await call("?code=BAD")
+    assert.equal(res.status, 307)
+    assert.equal(res.headers.get("location"), x.buildPortalLoginResultUrl(false))
+    await assert.rejects(result, /token request failed: 400/)
+  })
 })

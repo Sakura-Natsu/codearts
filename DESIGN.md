@@ -41,8 +41,12 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
      打开授权页并回调 `callback()`。
    - `authorize()` 内部：起 `127.0.0.1` 回调服务器（端口 ≥ 10000，对齐真实插件的
      端口要求）→ 生成 PKCE 对与 ES256 DPoP 密钥对 → 返回 portal 授权 URL。
-   - 回调收到 `code` 后向 STS 换取临时凭据；也兼容 portal 回退到旧 ticket 流程的
-     `secret` 分支。
+   - 回调只接受发到精确路径 `/oauth/callback`（按原样比较，不做 URL 规范化）、带 `code`
+     的 GET：向 STS 换取临时凭据后，307 跳到 portal 固定的结果页。其他方法 405；不带 code
+     （portal 报错）时立即判定登录失败并跳到失败页，不再干等 180 秒；同一次登录的后续回调 409。
+     旧 ticket 流程的 `secret` 分支（未实测、带开放重定向）已删除。
+   - 账号凭据只签给码道自己的两个主机：`snap-access.cn-north-4.myhuaweicloud.com` 与
+     `opengw.developer.huaweicloud.com`（https、默认端口），其他地址一律拒绝。
 
 2. **请求签名：Bearer API Key → SDK-HMAC-SHA256**
    - `loader` 不再返回 `apiKey`，而是返回 `baseURL` + 自定义 `fetch`，在 `fetch` 内

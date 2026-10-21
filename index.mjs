@@ -30,9 +30,9 @@
 //      `fetch`, and the account's live model list + quota are read from
 //      signed GETs.
 //   6. The gateway caps an account at 3 concurrent sessions (`TM.00001041`).
-//      Each account keeps one stable Chat-Id/Session-Id, its in-flight chats
-//      are gated, and a cap answer is retried until a session frees, then
-//      handed to magpie as a 429 so it can fail over.
+//      Each account keeps one stable session id (`x-ot-session-id`), at most
+//      3 of its chats are in flight, and a cap answer is retried until a
+//      session frees, then handed to magpie as a 429 so it can fail over.
 //   7. Chats always go upstream as SSE streams: CodeArts meters only streamed
 //      answers, so a caller that asked for JSON gets the stream folded back.
 //   8. `auth.checkin` presses the daily 「每日领取」 check-in the way the
@@ -55,20 +55,24 @@ const NPM = "@ai-sdk/openai-compatible" // chat completions
 // Chat Completions base (loader `baseURL`). A chat goes to
 // `${CHAT_API_BASE}/chat/completions`.
 const CHAT_API_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2"
-// Snap-access manager host: model list + account/quota + legacy ticket polling.
+// Snap-access manager host: model list, account/quota, check-in.
 const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
 const SNAP_MODEL_BUILTIN_URL = `${SNAP_HOST}/v1/model/builtin`
 const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
-const CREDENTIAL_ENDPOINT = `${SNAP_HOST}/snap-manager/v1/login/ticket`
 // opengw gateway config: the benefit/free-quota model set.
-const OPENGW_GATEWAY_CONFIG_URL = "https://opengw.developer.huaweicloud.com/api/v1/gateway/config"
+const OPENGW_HOST = "https://opengw.developer.huaweicloud.com"
+const OPENGW_GATEWAY_CONFIG_URL = `${OPENGW_HOST}/api/v1/gateway/config`
+// The only hosts the account's credentials are signed for and sent to: the
+// two the plugin itself calls, by name. STS takes the refresh token, never a
+// signature, and the portal only ever opens in the browser.
+const SIGNED_HOSTS = new Set([SNAP_HOST, OPENGW_HOST].map((u) => new URL(u).host))
 // The daily free token pool a `maas_type: benefit` chat draws on (never the
 // credit packages), so a free model's spend shows up in the usage panel.
-const BENEFIT_BALANCE_URL = "https://opengw.developer.huaweicloud.com/api/v1/user/tokens/balance"
+const BENEFIT_BALANCE_URL = `${OPENGW_HOST}/api/v1/user/tokens/balance`
 // The free models are the account's only once today's benefit is claimed: the
 // CodeArts agent POSTs this before it lists them (`claimBenefit`), and leaves
 // them out when it fails (4004 no benefit / expired, 4006 today's places gone).
-const BENEFIT_CLAIM_URL = "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+const BENEFIT_CLAIM_URL = `${OPENGW_HOST}/api/v1/benefit/claim`
 const BENEFIT_OK = "0000"
 // The agent's own model list, with each model's credit rate (`credit[].
 // ratio_display`, shown as "1.50x") and its parameters: the CodeAgent's detail.
@@ -129,7 +133,6 @@ const TOKEN_TIMEOUT_MS = 60_000
 const REQUEST_TIMEOUT_MS = 30_000
 const OAUTH_CALLBACK_TIMEOUT_MS = 180_000
 const MIN_CALLBACK_PORT = 10_000
-const LOGIN_POLL_ATTEMPTS = 120
 
 // magpie renews this long before the credential expires.
 const REFRESH_LEAD_MS = 30 * 60 * 1000
@@ -153,6 +156,9 @@ const SESSION_HEADER = "x-ot-session-id"
 // sends the request again, and DELETEs it when it gives up.
 const TRACE_QUEUE_URL = (traceId) => `${SNAP_HOST}/api/v1/concurrency/trace-queues/${encodeURIComponent(traceId)}`
 const QUEUE_BUDGET_MS = 300_000
+// Every chat of an account goes out under its one session id, so this gate is
+// what keeps the account within the vendor's 3 sessions: an option may only
+// lower it.
 const ACCOUNT_MAX_INFLIGHT = 3
 const SESSION_RETRY_DELAYS_MS = [2_000, 4_000, 6_000, 8_000, 10_000] // the last repeats
 const SESSION_RETRY_BUDGET_MS = 150_000
@@ -166,13 +172,6 @@ const MAX_OUTPUT_TOKENS = 65_536
 // caller shows the thinking as the answer; asked for explicitly it goes to
 // `reasoning_content` and `content` is the reply only.
 const ENABLE_THINKING = { type: "enabled" }
-
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
-  "Access-Control-Max-Age": "86400",
-}
 
 // Benefits (free-quota) models require `maas_type: benefit` as a *signed*
 // header, or the backend answers InferHub.002002009.404 "model is not
@@ -189,13 +188,12 @@ const BENEFIT_MODEL_FALLBACK = [
   "deepseek-v4-flash-0731",
   "deepseek-v4-pro-0813",
 ]
-// Which models draw on the free pool is the account's own answer: the fallback
-// stands only until gateway/config has been read once. An account without the
-// free campaign lists `deepseek-v4.1-flash` as a plain builtin model, and the
-// benefit header then gets `InferHub.4004.200 benefit not found`.
-let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
-// The builtin (credit-billed) ids the account lists; null until read.
-let regularModelIds = null
+// Which models draw on the free pool is each account's own answer, kept on the
+// account's state (`state.benefit`, with its builtin ids in `state.regular`):
+// the fallback stands only until that account's gateway/config has been read.
+// An account without the free campaign lists `deepseek-v4.1-flash` as a plain
+// builtin model, and the benefit header then gets `InferHub.4004.200 benefit
+// not found`. Nothing about models is shared between accounts.
 
 // Context windows (in tokens), keyed by the exact chat model id. Models
 // without an entry leave the window to the backend's default.
@@ -575,7 +573,12 @@ function exchangeRefreshToken(refreshToken, codeVerifier, keyPair, fetcher) {
 async function refreshCredential(cred, fetcher) {
   const refreshToken = firstOf(cred.refresh_token)
   if (!refreshToken || !cred.code_verifier || !cred.dpop_private_key_jwk) {
-    throw new Error("CodeArts: credential cannot be refreshed (missing refresh_token/code_verifier/dpop key)")
+    // Nothing to renew it with: it lapses for good, so the account is marked
+    // to sign in again rather than retried forever.
+    throw Object.assign(
+      new Error("CodeArts: credential cannot be refreshed (missing refresh_token/code_verifier/dpop key); sign in again"),
+      { signIn: "expired" },
+    )
   }
   const keyPair = keyPairFromStoredJwk(cred.dpop_private_key_jwk)
   const token = await exchangeRefreshToken(refreshToken, cred.code_verifier, keyPair, fetcher)
@@ -614,136 +617,91 @@ function buildOAuthLoginUrl(port, pkce, ticketId) {
 const buildPortalLoginResultUrl = (ok) =>
   `${PORTAL_LOGIN_BASE}?login_succeed=${ok}&uri_scheme=${CLIENT_ID}&locale=${OAUTH_LOCALE}`
 
-/** Normalize a legacy ticket/credential response. */
-function parseLegacyCredential(data) {
-  const cred = data?.credential
-  if (cred) {
-    const ak = cred.access ?? ""
-    const st = cred.securitytoken ?? cred.securityToken ?? ""
-    if (ak && st) {
-      return {
-        access_key_id: ak,
-        secret_access_key: cred.secret ?? "",
-        security_token: st,
-        expires_at: cred.expires_at ?? cred.expiresAt ?? "",
-        domain_id: data.domain_id ?? "",
-        user_id: data.user_id ?? "",
-        user_name: data.user_name ?? "",
-      }
-    }
-  }
-  const r = data?.result
-  if (r) {
-    const ak = r.accessKeyId ?? ""
-    const st = r.securityToken ?? ""
-    if (ak && st) {
-      return {
-        access_key_id: ak,
-        secret_access_key: r.secretAccessKey ?? "",
-        security_token: st,
-        expires_at: r.expiration ?? r.expiresAt ?? "",
-      }
-    }
-  }
-  return null
-}
-
-/** Poll the legacy ticket endpoint until a credential arrives. */
-async function pollForCredential(ticketId, secret, fetcher) {
-  const url = `${CREDENTIAL_ENDPOINT}?ticket_id=${encodeURIComponent(ticketId)}&secret=${encodeURIComponent(secret)}`
-  for (let i = 0; i < LOGIN_POLL_ATTEMPTS; i++) {
-    if (i > 0) await new Promise((r) => setTimeout(r, 1000))
-    let res
-    try {
-      res = await fetcher(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json;charset=UTF-8",
-          "plugin-name": LOGIN_PLUGIN_NAME,
-          "plugin-version": LOGIN_PLUGIN_VERSION,
-        },
-      })
-    } catch {
-      continue
-    }
-    if (!res.ok) continue
-    let data = null
-    try {
-      data = await res.json()
-    } catch {
-      continue
-    }
-    const cred = data ? parseLegacyCredential(data) : null
-    if (cred) return cred
-  }
-  throw new Error("CodeArts login timed out")
-}
-
-/** Start the loopback callback server, listening on 127.0.0.1:port>=10000. */
-function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
+/**
+ * Start the loopback callback server, listening on 127.0.0.1:port>=10000. It
+ * takes one thing: a GET to the callback path, exactly as sent, with the
+ * authorization code, which it exchanges at STS (PKCE + DPoP), then sends the
+ * browser on to the portal's own result page. A callback without a code ends
+ * the sign-in at once, with the portal's own words when it gave any. The
+ * redirect target is always that page, never a parameter of the request.
+ */
+function startOAuthCallbackServer(pkce, keyPair, fetcher) {
   let resolveResult
   let rejectResult
   const result = new Promise((resolve, reject) => {
     resolveResult = resolve
     rejectResult = reject
   })
+  let answered = false
 
   const server = createServer((request, response) => {
-    const url = new URL(request.url ?? "/", `http://127.0.0.1:${request.socket.localPort}`)
-    if (url.pathname !== REDIRECT_PATH && !url.pathname.startsWith(REDIRECT_PATH)) {
+    // The path as sent, not as a URL would normalise it (`/oauth/./callback`).
+    const raw = request.url ?? "/"
+    const query = raw.indexOf("?")
+    if ((query < 0 ? raw : raw.slice(0, query)) !== REDIRECT_PATH) {
       response.writeHead(404).end("Not found")
       return
     }
-    if (request.method === "OPTIONS") {
-      response.writeHead(204, CORS_HEADERS).end()
+    if (request.method !== "GET") {
+      response.writeHead(405, { Allow: "GET" }).end("Method not allowed")
       return
     }
-    const done = (cred) => resolveResult({ access: JSON.stringify(cred), expires: expiresFromCredential(cred) })
-
-    // Legacy fallback: the portal decided OAuth is unavailable and redirected
-    // with a secret; poll the ticket endpoint in the background.
-    const callbackSecret = url.searchParams.get("secret")
-    if (callbackSecret) {
-      const redirectTo = url.searchParams.get("redirect") ?? buildPortalLoginResultUrl(true)
-      response.writeHead(307, { ...CORS_HEADERS, Location: redirectTo }).end()
-      void pollForCredential(ticketId, callbackSecret, fetcher).then(done, rejectResult)
+    // One sign-in, one callback: another one for the same flow is refused.
+    if (answered) {
+      response.writeHead(409).end("This sign-in is already being completed")
       return
     }
-    // New IAM OAuth: an authorization code to exchange at STS.
+    answered = true
+    const url = new URL(raw, `http://127.0.0.1:${request.socket.localPort}`)
     const code = url.searchParams.get("code")
-    if (code) {
-      const port = request.socket.localPort ?? 0
-      void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
-        (token) => {
-          response.writeHead(307, { ...CORS_HEADERS, Location: buildPortalLoginResultUrl(true) }).end()
-          done(credentialFromTokenResponse(token, pkce.codeVerifier, keyPair))
-        },
-        (error) => {
-          response.writeHead(307, { ...CORS_HEADERS, Location: buildPortalLoginResultUrl(false) }).end()
-          rejectResult(error)
-        },
-      )
+    if (!code) {
+      response.writeHead(307, { Location: buildPortalLoginResultUrl(false) }).end()
+      const said = firstOf(url.searchParams.get("error_description"), url.searchParams.get("error"))
+      rejectResult(new Error(`CodeArts sign-in failed: ${said || "the callback came back without an authorization code"}`))
       return
     }
-    response.writeHead(400).end("Missing authorization code or secret")
+    const port = request.socket.localPort ?? 0
+    void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
+      (token) => {
+        response.writeHead(307, { Location: buildPortalLoginResultUrl(true) }).end()
+        const cred = credentialFromTokenResponse(token, pkce.codeVerifier, keyPair)
+        resolveResult({ access: JSON.stringify(cred), expires: expiresFromCredential(cred) })
+      },
+      (error) => {
+        response.writeHead(307, { Location: buildPortalLoginResultUrl(false) }).end()
+        rejectResult(error)
+      },
+    )
   })
 
   return listenOnCallbackPort(server).then((port) => ({ port, server, result }))
 }
 
-/** Listen on 127.0.0.1, retrying with a random port >= 10000 if needed. */
+const CALLBACK_PORT_TRIES = 20
+const randomCallbackPort = () => Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT)) + MIN_CALLBACK_PORT
+
+/**
+ * Listen on 127.0.0.1: the port the system gives, or, when that is below
+ * 10000, a random one >= 10000, another while the one picked is taken.
+ */
 function listenOnCallbackPort(server) {
   return new Promise((resolve, reject) => {
+    let tries = 0
     const tryListen = (port) => {
-      server.once("error", reject)
+      const failed = (e) => {
+        if (port !== 0 && e?.code === "EADDRINUSE" && ++tries < CALLBACK_PORT_TRIES) tryListen(randomCallbackPort())
+        else reject(e)
+      }
+      server.once("error", failed)
       server.listen(port, "127.0.0.1", () => {
+        server.off("error", failed)
         const address = server.address()
         const assigned = typeof address === "object" && address ? address.port : 0
         if (assigned >= MIN_CALLBACK_PORT) {
           resolve(assigned)
           return
         }
-        server.close(() => tryListen(Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT)) + MIN_CALLBACK_PORT))
+        server.close(() => tryListen(randomCallbackPort()))
       })
     }
     tryListen(0)
@@ -756,11 +714,12 @@ function listenOnCallbackPort(server) {
  * the callback server is closed as soon as the result settles.
  */
 async function startOAuthFlow(fetcher) {
-  const ticketId = randomHex(32)
   const pkce = await generatePkcePair()
   const keyPair = await generateDpopKeyPair()
-  const { port, server, result } = await startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher)
-  const loginUrl = buildOAuthLoginUrl(port, pkce, ticketId)
+  const { port, server, result } = await startOAuthCallbackServer(pkce, keyPair, fetcher)
+  // The authorize URL carries a ticket_id as the IDE's does; the code flow
+  // itself never reads it back.
+  const loginUrl = buildOAuthLoginUrl(port, pkce, randomHex(32))
 
   let closed = false
   const close = async () => {
@@ -814,18 +773,22 @@ async function toBytes(body) {
   return utf8(String(body))
 }
 
-/** Is `model` one that needs the signed `maas_type: benefit` header? */
-function isBenefitModel(model) {
-  return benefitModelIds.includes(String(upstreamModelId(model) ?? ""))
+/**
+ * Is `model` one of the account's free models, sent with the signed
+ * `maas_type: benefit` header? `state.benefit` is the account's own list once
+ * read (null until then, when the fallback stands); one the gateway said has
+ * no benefit (`state.noBenefit`) is not.
+ */
+function isBenefitModel(model, state) {
+  const id = String(upstreamModelId(model) ?? "")
+  const free = state?.benefit ? state.benefit.has(id) : BENEFIT_MODEL_FALLBACK.includes(id)
+  return free && !state?.noBenefit?.has(id)
 }
 
-/** The account's free models as gateway/config lists them (it replaces the fallback). */
-function rememberBenefitIds(ids) {
-  benefitModelIds = [...new Set(ids)]
+/** Can `model` be called without the benefit header: one of the account's builtin models, or not known yet? */
+function isRegularModel(model, state) {
+  return !state?.regular || state.regular.has(String(upstreamModelId(model) ?? ""))
 }
-
-/** Can `model` be called without the benefit header (a builtin model, or not known yet)? */
-const isRegularModel = (model) => regularModelIds === null || regularModelIds.includes(String(upstreamModelId(model) ?? ""))
 
 /**
  * Reshape a chat body into what the gateway accepts and meters:
@@ -870,7 +833,8 @@ function parseSseEvents(text) {
 
 /** The error code an answer carries (`TM.00001041`, `InferHub.4291.200`, …), or "". */
 function errorCodeOf(text) {
-  const m = /"(?:error_code|code)"\s*:\s*"([A-Za-z]*\.?[0-9][0-9A-Za-z.]*)"/.exec(String(text ?? ""))
+  // Any number of named parts before the digits: `InferHub.ModelArts.81111.429`.
+  const m = /"(?:error_code|code)"\s*:\s*"((?:[A-Za-z]+\.)*[A-Za-z]*[0-9][0-9A-Za-z.]*)"/.exec(String(text ?? ""))
   return m ? m[1] : ""
 }
 
@@ -929,7 +893,9 @@ function classifyHead(text, done) {
   const code = errorCodeOf(text)
   // Wait for the error event's end, so its message is whole.
   if (code) return done || /\n/.test(text.slice(text.indexOf(code))) ? code : undefined
-  if (done || text.includes("[DONE]")) return "answer"
+  // The stream's own end, never a "[DONE]" inside an event: the gateway's
+  // rate-limit error carries `"text":"[DONE]"`.
+  if (done || /^data:\s*\[DONE\]\s*$/m.test(text)) return "answer"
   return undefined
 }
 
@@ -1072,6 +1038,16 @@ function signInExpiredResponse(text) {
   return new Response(body, { status: 401, headers: { "content-type": "application/json", "X-Magpie-Sign-In": "expired" } })
 }
 
+/**
+ * A stale credential that couldn't be renewed: turned away for good, a 401
+ * that marks the sign-in; or only for now (STS unreachable, a DPoP proof
+ * refused), a 503 that keeps it, for magpie to try again or fail over.
+ */
+function unrenewedResponse(context, text) {
+  if (context.signInDead?.()) return signInExpiredResponse(text)
+  return errorResponse(503, errorCodeOf(text), "临时凭据已过期，续期暂时失败，请稍后再试", { "X-Magpie-Sign-In": "kept" })
+}
+
 /** Rebuild a response whose body was read, keeping the vendor's answer. */
 function rebuildResponse(res, text, extraHeaders = {}) {
   const headers = streamHeaders(res.headers)
@@ -1178,7 +1154,13 @@ async function traceQueueCall(method, cred, traceId, context, signal) {
     if (key !== "host") headers.set(key, value)
   })
   headers.set(SESSION_HEADER, context.sessionId)
-  return context.fetcher(url, { method, headers, ...(signal ? { signal } : {}) })
+  return context.fetcher(url, { method, headers, signal })
+}
+
+/** The caller's signal, bounded to `ms` from now: a call that hangs can't outlast the wait it is part of. */
+function withinMs(signal, ms) {
+  const timeout = AbortSignal.timeout(Math.max(0, Math.min(ms, REQUEST_TIMEOUT_MS)))
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
 }
 
 /**
@@ -1188,7 +1170,7 @@ async function traceQueueCall(method, cred, traceId, context, signal) {
  * Gives "promoted" or "gone"; throws the abort.
  */
 async function waitInQueue(cred, queued, context, signal, deadline) {
-  const leave = () => void traceQueueCall("DELETE", cred, queued.traceId, context).catch(() => {})
+  const leave = () => void traceQueueCall("DELETE", cred, queued.traceId, context, AbortSignal.timeout(REQUEST_TIMEOUT_MS)).catch(() => {})
   let retryAfter = queued.retryAfter
   let failures = 0
   try {
@@ -1200,12 +1182,16 @@ async function waitInQueue(cred, queued, context, signal, deadline) {
       await delay(retryAfter * 1000, signal)
       let body = null
       try {
-        const res = await traceQueueCall("GET", cred, queued.traceId, context, signal)
+        // The poll and its answer are bounded by what is left of the wait.
+        const res = await traceQueueCall("GET", cred, queued.traceId, context, withinMs(signal, deadline - Date.now()))
         body = safeJson(await res.text())
         if (!res.ok && !body?.status) throw new Error(`HTTP ${res.status}`)
       } catch (e) {
         if (signal?.aborted) throw e
-        if (++failures >= 3) return "gone"
+        if (++failures >= 3) {
+          leave()
+          return "gone"
+        }
         continue
       }
       const status = String(body?.status ?? "queued")
@@ -1216,6 +1202,25 @@ async function waitInQueue(cred, queued, context, signal, deadline) {
   } catch (e) {
     leave()
     throw e
+  }
+}
+
+/** The host of a URL, "" when it isn't one. */
+function hostOf(url) {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ""
+  }
+}
+
+/** Is this an https URL on one of SIGNED_HOSTS (its default port), the only ones the credentials go to? */
+function isSignedHostUrl(url) {
+  try {
+    const u = new URL(url)
+    return u.protocol === "https:" && SIGNED_HOSTS.has(u.host)
+  } catch {
+    return false
   }
 }
 
@@ -1235,15 +1240,23 @@ function withSignInMark(res) {
  *   a session frees or the budget runs out — then a 429, which magpie fails
  *   over on;
  * - a stale credential (401, `APIG.0602`) is renewed once and the request sent
- *   again; when that can't be done, a 401 marks the sign-in;
+ *   again; when STS turns the renewal away for good, a 401 marks the sign-in,
+ *   and when it only fails for now, a 503 keeps it;
+ * - `benefit not found` on a day not yet claimed claims it and sends again;
+ *   otherwise the model goes as the account's builtin one, if it has it;
  * - a 200 carrying only an error (a spent quota, an unknown model) becomes a
  *   429/502 with the vendor's words instead of an empty reply.
  * The permit is held until the answer's body ends: the gateway counts the
- * session while it streams.
+ * session while it streams. Only SIGNED_HOSTS are signed for: a request
+ * anywhere else (an overridden `api`, say) is refused before the access key or
+ * security token leave.
  */
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
   const url = req ? req.url : String(input)
+  if (!isSignedHostUrl(url)) {
+    return errorResponse(400, "", `refusing to sign a request to ${hostOf(url) || "an unknown host"}: only CodeArts' own hosts (${[...SIGNED_HOSTS].join(", ")}) get the account's credentials`)
+  }
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const baseHeaders = new Headers(init?.headers ?? req?.headers)
   let body
@@ -1255,8 +1268,7 @@ async function signedFetch(cred, input, init, context) {
   const chat = prepareChatBody(parsed, context)
   if (chat) body = utf8(JSON.stringify(chat.body))
   const model = upstreamModelId(parsed?.model)
-  const free = context.isBenefit ? context.isBenefit(model) : isBenefitModel(model) && !context.noBenefit?.has(model)
-  let extra = free ? { maas_type: "benefit" } : undefined
+  let extra = isBenefitModel(model, context.state) ? { maas_type: "benefit" } : undefined
   const signal = init?.signal ?? req?.signal ?? undefined
 
   let active = cred
@@ -1266,6 +1278,8 @@ async function signedFetch(cred, input, init, context) {
       method, url, body, extra,
     )
     const headers = new Headers(baseHeaders)
+    // The body may have been reshaped: the transport counts it again.
+    headers.delete("content-length")
     signed.forEach((value, key) => {
       if (key !== "host") headers.set(key, value)
     })
@@ -1291,13 +1305,23 @@ async function signedFetch(cred, input, init, context) {
 
   // A sign-in known to be beyond renewal never reaches the network again.
   if (context.signInDead?.()) return signInExpiredResponse()
-  if (!chat) return withSignInMark(await send())
+  if (!chat) {
+    const res = await send()
+    if (res.status !== 401 || !context.renewCredential) return withSignInMark(res)
+    const text = await res.text().catch(() => "")
+    const next = await context.renewCredential(active)
+    if (!next) return unrenewedResponse(context, text)
+    active = next
+    return withSignInMark(await send())
+  }
 
   const release = await context.gate.acquire(signal)
   let handedOver = false
   try {
-    const started = Date.now()
+    const clock = context.now ?? Date.now
+    const started = clock()
     let renewed = false
+    let claimTried = false
     let queueDeadline = 0
     for (let attempt = 0; ; attempt += 1) {
       const res = await send()
@@ -1334,6 +1358,7 @@ async function signedFetch(cred, input, init, context) {
             active = next
             continue
           }
+          return unrenewedResponse(context, text)
         }
         return signInExpiredResponse(text)
       }
@@ -1346,17 +1371,26 @@ async function signedFetch(cred, input, init, context) {
         body = utf8(JSON.stringify(chat.body))
         continue
       }
-      // No free benefit for this model on this account (`4004`), or the header
-      // isn't taken for it (`4005`): it is the account's plain builtin model.
-      if (extra && /InferHub\.400[45]\.200|benefit not found/i.test(code || text) && isRegularModel(model)) {
-        context.noBenefit?.add(model)
-        extra = undefined
-        continue
+      if (extra && /InferHub\.400[45]\.200|benefit not found/i.test(code || text)) {
+        // A new Beijing day whose benefit isn't claimed yet: claim it, as the
+        // agent does each day, and send it again as the free model.
+        if (!claimTried && context.state && context.state.claim?.day !== beijingDay()) {
+          claimTried = true
+          if (await ensureBenefitClaimed(active, context.fetcher, context.state)) continue
+        }
+        // No free benefit for this model on this account (`4004`), or the
+        // header isn't taken for it (`4005`): it is the account's plain
+        // builtin model, till the next day's claim.
+        if (isRegularModel(model, context.state)) {
+          context.state?.noBenefit.add(model)
+          extra = undefined
+          continue
+        }
       }
       if (code === SESSION_LIMIT_ERROR || text.includes(SESSION_LIMIT_ERROR)) {
         const wait = retryDelayMs(attempt, context.retryDelays)
-        if (Date.now() - started + wait <= (context.retryBudgetMs ?? SESSION_RETRY_BUDGET_MS)) {
-          await delay(wait, signal)
+        if (clock() - started + wait <= (context.retryBudgetMs ?? SESSION_RETRY_BUDGET_MS)) {
+          await (context.sleep ?? delay)(wait, signal)
           continue
         }
         return errorResponse(429, SESSION_LIMIT_ERROR, firstOf(errorMessageOf(text), "并发会话数已达上限，请稍后再试"))
@@ -1586,11 +1620,21 @@ async function dailyCheckin(cred, fetcher) {
   const item = first.item
   if (!item) return { outcome: "inactive", message: "当前没有每日领取活动" }
   const credit = num(item.benefitAmount)
+  // Claimed but never confirmed (a confirm that failed): confirm it now, or
+  // the credits stay pending. When the confirm fails, only the activity
+  // itself tells whether it was confirmed after all; still claimed, it is a
+  // failure magpie tries again later that day.
+  const campaign = item.campaignId !== undefined && item.campaignId !== null && item.campaignId !== ""
+  if (!item.claimable && item.status === "CLAIMED" && campaign) {
+    const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
+    if (confirmed.ok) return claimedOutcome({}, credit)
+    const again = await dailyCampaign(cred, fetcher)
+    if (isClaimedToday(again.item) && again.item.status !== "CLAIMED") return { outcome: "done", message: "今天已领取" }
+    return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
+  }
   if (isClaimedToday(item)) return { outcome: "done", message: "今天已领取" }
   if (!item.claimable) return { outcome: "ineligible", message: `当前不可领取（status=${item.status ?? "null"}）` }
-  if (item.campaignId === undefined || item.campaignId === null || item.campaignId === "") {
-    return { outcome: "failed", message: "活动缺少 campaignId" }
-  }
+  if (!campaign) return { outcome: "failed", message: "活动缺少 campaignId" }
 
   const claimed = await snapRequest("POST", OPS_CLAIM_URL, cred, fetcher, { campaignId: item.campaignId, channel: OPS_CHANNEL })
   if (!claimed.ok) {
@@ -1604,6 +1648,11 @@ async function dailyCheckin(cred, fetcher) {
     const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
     if (!confirmed.ok) return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
   }
+  return claimedOutcome(benefit, credit)
+}
+
+/** The outcome of a check-in that went through, with the grant the ledger keeps. */
+function claimedOutcome(benefit, credit) {
   const got = num(benefit.benefitAmount) || credit
   const at = Date.now()
   const grant = { at: new Date(at).toISOString(), credit: got, expiresAt: new Date(grantExpiry(benefit, at)).toISOString() }
@@ -1677,7 +1726,8 @@ const CLAIM_RETRY_MS = 60 * 60 * 1000
 /**
  * Is today's free benefit the account's? Claimed once a Beijing day (one claim
  * at a time); a refusal is asked again an hour later, and a vendor that can't
- * be reached leaves the last answer standing.
+ * be reached leaves the last answer standing. A claim that goes through starts
+ * the day afresh: the models the last one had no benefit for are asked again.
  */
 function ensureBenefitClaimed(cred, fetcher, state) {
   const day = beijingDay()
@@ -1687,6 +1737,7 @@ function ensureBenefitClaimed(cred, fetcher, state) {
     .then((r) => {
       if (r.network) return was?.ok ?? false
       state.claim = { day, ok: r.ok, at: Date.now(), code: r.code, message: r.message }
+      if (r.ok) state.noBenefit?.clear()
       return r.ok
     })
     .finally(() => { state.claiming = null })
@@ -1764,10 +1815,11 @@ async function fetchAgentModels(cred, fetcher, state) {
  *   claimed for the account (else they are left out: they answer `benefit not
  *   found`, and the plain builtin model of the same id stays);
  * - the builtin models;
- * - the CodeAgent's own list, which gives every model its credit rate and
+ * - the main agent's own list, which gives every model its credit rate and
  *   adds the ones the builtin list leaves out.
- * `state` is the account's own (claim, agent id, free models); without one the
- * free list is taken as it is published.
+ * `state` is the account's own: its claim, agent id, free models
+ * (`state.benefit`) and builtin ones (`state.regular`) are kept there and
+ * nowhere else. Without one the free list is taken as it is published.
  */
 async function fetchRemoteModels(cred, fetcher, state) {
   const models = []
@@ -1823,13 +1875,12 @@ async function fetchRemoteModels(cred, fetcher, state) {
     }
   }
 
-  // An answered list is the truth, an empty one included; a failed read keeps
-  // what was known.
-  if (gateway) {
-    rememberBenefitIds(benefitIds)
-    if (state) state.benefit = new Set(benefitIds)
+  // The account's own lists: an answered list is the truth, an empty one
+  // included; a failed read keeps what was known.
+  if (state) {
+    if (gateway) state.benefit = new Set(benefitIds)
+    if (builtin) state.regular = new Set(regularIds)
   }
-  if (builtin) regularModelIds = regularIds
   return models
 }
 
@@ -1881,7 +1932,7 @@ const MONTHLY_CREDIT_METRICS = ["usageTotalPackageCredit", "usageBasicPackageCre
  * The free daily token pool as a window, scoped to the models that draw on it.
  * `aside`: an empty free pool leaves the paid models usable.
  */
-function benefitWindow(raw, ids = benefitModelIds) {
+function benefitWindow(raw, ids = BENEFIT_MODEL_FALLBACK) {
   const rec = asRecord(asRecord(raw).result ?? asRecord(raw).data ?? raw)
   const limit = num(rec.daily_token_limit)
   if (limit <= 0) return undefined
@@ -1973,30 +2024,61 @@ function usageFromStatistics(raw, benefitRaw, { batches, grants, benefitIds } = 
 
 export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
-  // Tunables (magpie: `magpie plugin options <name> '{…}'`).
-  const maxInflight = Number.isInteger(options?.maxInflight) && options.maxInflight > 0 ? options.maxInflight : ACCOUNT_MAX_INFLIGHT
+  // Tunables (magpie: `magpie plugin options <name> '{…}'`). `maxInflight` can
+  // only lower the gate: above 3 the account would pass the vendor's cap.
+  const maxInflight = Number.isInteger(options?.maxInflight) && options.maxInflight > 0
+    ? Math.min(options.maxInflight, ACCOUNT_MAX_INFLIGHT)
+    : ACCOUNT_MAX_INFLIGHT
   const retryBudgetMs = Number.isFinite(options?.retryBudgetMs) ? Math.max(0, options.retryBudgetMs) : SESSION_RETRY_BUDGET_MS
   const retryDelays = Array.isArray(options?.retryDelays) && options.retryDelays.length ? options.retryDelays : SESSION_RETRY_DELAYS_MS
   const queueBudgetMs = Number.isFinite(options?.queueBudgetMs) ? Math.max(0, options.queueBudgetMs) : QUEUE_BUDGET_MS
   const thinking = options?.thinking !== false
   const ledgerPath = typeof options?.ledgerPath === "string" && options.ledgerPath ? options.ledgerPath : defaultLedgerPath()
+  // Test hooks: the clock and the sleep the retry budget runs on.
+  const now = typeof options?.now === "function" ? options.now : Date.now
+  const sleep = typeof options?.sleep === "function" ? options.sleep : delay
 
-  // Per account, shared by every loader this process runs for it: the gate;
-  // the free models it has today (null until gateway/config was read; the
-  // fallback stands until then) and the ones the gateway said it has no
-  // benefit for; today's benefit claim; its CodeAgent id.
+  // Per account, shared by every loader this process runs for it and by
+  // nothing else: the gate; its free models today (null until its
+  // gateway/config was read; the fallback stands until then), its builtin
+  // ones, and the ones the gateway said it has no benefit for; today's
+  // benefit claim; its main agent's id; its credit batches; the renewal of its
+  // credential under way, and the last one made.
   const accounts = new Map()
   const accountState = (key) => {
     if (!accounts.has(key)) {
       accounts.set(key, {
-        gate: createConcurrencyGate(maxInflight), benefit: null, noBenefit: new Set(), claim: null, claiming: null, agentId: "",
-        batches: undefined, batchesAt: 0,
+        gate: createConcurrencyGate(maxInflight), benefit: null, regular: null, noBenefit: new Set(),
+        claim: null, claiming: null, agentId: "", batches: undefined, batchesAt: 0,
+        renewing: null, renewed: null,
       })
     }
     return accounts.get(key)
   }
   const stateOf = async (cred) => accountState((await accountSessionIds(cred)).sessionId)
-  const isFreeFor = (state, id) => (state.benefit ?? new Set(benefitModelIds)).has(id) && !state.noBenefit.has(id)
+
+  // One renewal per refresh token, whoever asks for it (each of the account's
+  // loaders, magpie's auth.refresh): STS spends a refresh token once, so a
+  // second use of it would turn the account away. Whoever comes later with
+  // the same token gets what that renewal gave.
+  const renewOnce = async (cred) => {
+    const token = firstOf(cred.refresh_token)
+    if (!token) return refreshCredential(cred, fetcher)
+    const state = await stateOf(cred)
+    if (state.renewed?.from === token) return state.renewed.next
+    if (state.renewing?.from !== token) {
+      const promise = refreshCredential(cred, fetcher)
+        .then((next) => {
+          state.renewed = { from: token, next }
+          return next
+        })
+        .finally(() => {
+          if (state.renewing?.promise === promise) state.renewing = null
+        })
+      state.renewing = { from: token, promise }
+    }
+    return state.renewing.promise
+  }
   // The ledger's key: the signer, which outlives a sign-in; else the session.
   const ledgerKey = async (cred) => accountIdentityOf(cred).id || (await accountSessionIds(cred)).sessionId
 
@@ -2069,7 +2151,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async refresh(auth) {
         const cred = credentialOf(auth)
         if (!cred) return undefined
-        const next = await refreshCredential(cred, fetcher)
+        const next = await renewOnce(cred)
         const accountId = auth.accountId ? "" : accountIdentityOf(next).id
         return {
           access: JSON.stringify(next),
@@ -2087,32 +2169,41 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
 
         // magpie renews ahead of expiry by itself; this covers hosts that
         // ignore `auth.refresh` (OpenCode) and a credential that went stale
-        // anyway (a 401 / APIG.0602). One renewal at a time; null when it fails.
+        // anyway (a 401 / APIG.0602). One renewal at a time, shared with the
+        // account's other loaders and auth.refresh; null when it fails.
         let refreshing = null
         let signInDead = false
+        // Another renewal may have landed already (magpie's own, or another
+        // process's): the stored one, when it is newer than `than`.
+        const takeStored = async (than) => {
+          const latest = await getAuth().catch(() => null)
+          const stored = credentialOf(latest)
+          if (!stored || !than(stored)) return { latest, stored: null }
+          cred = stored
+          account = latest
+          return { latest, stored }
+        }
         const renewCredential = (stale) => {
           if (signInDead) return Promise.resolve(null)
           refreshing ??= (async () => {
-            // Another renewal may have landed already (magpie's own, or another
-            // process): take that over rather than spend the refresh token twice.
-            const latest = await getAuth().catch(() => null)
-            const stored = credentialOf(latest)
-            if (stored && stored.access_key_id !== stale.access_key_id && !nearExpiry(stored)) {
-              cred = stored
-              account = latest
-              return stored
-            }
-            const base = stored ?? cred
-            if (!base.refresh_token) return null
-            const next = await refreshCredential(base, fetcher)
-            cred = next
-            account = await persistCredential(client, latest ?? account, next)
-            return next
-          })()
-            .catch((e) => {
-              if (isPermanentRefreshFailure(e)) signInDead = true
+            const first = await takeStored((s) => s.access_key_id !== stale.access_key_id && !nearExpiry(s))
+            if (first.stored) return first.stored
+            const base = credentialOf(first.latest) ?? cred
+            try {
+              const next = await renewOnce(base)
+              cred = next
+              account = await persistCredential(client, first.latest ?? account, next)
+              return next
+            } catch (e) {
+              if (!isPermanentRefreshFailure(e)) return null
+              // The token was spent a moment ago by someone else: theirs stands.
+              const after = await takeStored((s) => !!s.refresh_token && s.refresh_token !== base.refresh_token)
+              if (after.stored) return after.stored
+              signInDead = true
               return null
-            })
+            }
+          })()
+            .catch(() => null)
             .finally(() => { refreshing = null })
           return refreshing
         }
@@ -2127,9 +2218,11 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         const context = {
           ...ids,
           gate: state.gate,
-          noBenefit: state.noBenefit,
-          // Read at each request: the models hook updates the free list.
-          isBenefit: (model) => isFreeFor(state, model),
+          // The account's own model lists, read at each request (the models
+          // hook keeps them current).
+          state,
+          now,
+          sleep,
           fetcher,
           retryBudgetMs,
           retryDelays,
@@ -2170,7 +2263,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           const usage = usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText), {
             batches: state.batches,
             grants: readGrants(ledgerPath, await ledgerKey(cred)),
-            benefitIds: state.benefit ? [...state.benefit] : benefitModelIds,
+            benefitIds: state.benefit ? [...state.benefit] : BENEFIT_MODEL_FALLBACK,
           })
           const user = accountIdentityOf(cred).name
           return user ? { ...usage, user } : usage
@@ -2275,14 +2368,14 @@ export const _internal = {
   credentialFromTokenResponse, credentialOf, expiresFromCredential, accountIdentityOf, accountSessionIds,
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   isDeadRefreshToken, isPermanentRefreshFailure, nearExpiry, persistCredential,
-  buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
-  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
+  buildOAuthLoginUrl, buildPortalLoginResultUrl,
+  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow, isSignedHostUrl, hostOf, SIGNED_HOSTS,
   BENEFIT_CLAIM_URL, AGENT_LIST_URL, AGENT_DETAIL_URL, CODE_AGENT_ID,
   canonicalQuery, beijingDay, nextBeijingMidnight, vendorDate, creditRateOf,
   claimBenefit, ensureBenefitClaimed, parseAgentModel, fetchAgentModels,
   readGrants, recordGrant, grantExpiry, grantBatches, soonestLapse, fetchCreditBatches,
   PACKAGE_CREDIT_PAGE_URL, OPS_CREDIT_OVERVIEW_URL, OPS_CREDIT_CAMPAIGN_URL,
-  toBytes, isBenefitModel, rememberBenefitIds, prepareChatBody, signedFetch, signedGet,
+  toBytes, isBenefitModel, prepareChatBody, signedFetch, signedGet,
   parseSseEvents, errorCodeOf, errorMessageOf, isStaleCredential, isRateLimitCode, embeddedErrorStatus, classifyHead,
   peekAnswer, completionFromChunks, createConcurrencyGate, delay, retryDelayMs,
   isRegularModel, queueInfoOf, waitInQueue, TRACE_QUEUE_URL, SESSION_HEADER,
